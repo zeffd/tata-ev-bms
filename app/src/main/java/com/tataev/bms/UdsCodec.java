@@ -192,6 +192,31 @@ final class UdsCodec {
      * An ECU may reply 7F xx 78 (responsePending) and then send the actual
      * response on the same ID; the pending frame must not mask the real one.
      */
+    /**
+     * Every CAN id that produced any decodable frame in this text. After a
+     * functional-broadcast probe the IDS are the whole yield - each one is an
+     * ECU announcing it exists; the payloads do not matter.
+     */
+    static List<String> respondingIds(String text) {
+        return new java.util.ArrayList<>(reassembleAll(text, 3).keySet());
+    }
+
+    /**
+     * The request id an ECU answering on {@code responseId} listens on. The
+     * reply convention is request + 8 - Tata's 0x7xx block and ISO's 7E0/7E8
+     * both follow it. Null when the arithmetic leaves the usable range.
+     */
+    static String requestIdFor(String responseId) {
+        try {
+            int resp = Integer.parseInt(responseId, 16);
+            int req = resp - 8;
+            if (req < 0 || req > 0x7F7) return null;
+            return String.format(java.util.Locale.ROOT, "%03X", req);
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
     static Map<String, byte[]> reassemble(String text, int idLen) {
         Map<String, byte[]> best = new HashMap<>();
         for (Map.Entry<String, List<byte[]>> e : reassembleAll(text, idLen).entrySet()) {

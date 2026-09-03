@@ -69,6 +69,7 @@ public final class SelfTest {
         seededPackMap();
         scanLinkLoss();
         classification();
+        discovery();
         seriesCountStability();
         findings();
         socContext();
@@ -1721,6 +1722,27 @@ public final class SelfTest {
         r.values.put("current_a", amps);
         r.computeDerived();
         return r;
+    }
+
+    /**
+     * Broadcast discovery: a functional probe's reply text names every ECU on
+     * the bus, and each response id maps back to a typable request id.
+     */
+    private static void discovery() {
+        System.out.println("\n=== broadcast ECU discovery ===");
+        // Three ECUs answer one functional probe: a session reply, an NRC, and
+        // a TesterPresent acknowledgement - all single frames, all count.
+        String text = "7E80462F18601\n78D037F2211\n7C6027E00";
+        check("all responding ids heard", UdsCodec.respondingIds(text).size(), 3);
+        check("Tata pair maps back", UdsCodec.requestIdFor("78D"), "785");
+        check("ISO pair maps back", UdsCodec.requestIdFor("7E8"), "7E0");
+        check("below-range response rejected", UdsCodec.requestIdFor("005"), null);
+        check("junk rejected", UdsCodec.requestIdFor("XYZ"), null);
+        check("bare ATCRA (open filter) is allowed",
+                CommandGuard.isAllowed("ATCRA"), true);
+        check("ATCRA with an id still allowed",
+                CommandGuard.isAllowed("ATCRA 78D"), true);
+        check("ATMA is still refused", CommandGuard.isAllowed("ATMA"), false);
     }
 
     /** A Reading carrying exactly the pack-map-required roles, nothing else. */

@@ -200,6 +200,19 @@ public final class BmsService extends Service {
         return trouble;
     }
 
+    /** ECUs the broadcast probe heard that were not identified; "" when none. */
+    private static volatile String discoveredEcus = "";
+    /** Path of the last saved detection report, or null. */
+    private static volatile String detectReportPath;
+
+    static String discoveredEcus() {
+        return discoveredEcus;
+    }
+
+    static String detectReportPath() {
+        return detectReportPath;
+    }
+
     static double actualPeriodS() {
         return actualPeriodS;
     }
@@ -612,6 +625,25 @@ public final class BmsService extends Service {
                             publish(null);
                         });
                 if (found == null) {
+                    // The candidate list failed - ask the WHOLE bus who is there
+                    // before giving up. A model whose BMS lives at an address
+                    // this app has never seen (the first Tiago EV field report)
+                    // is found this way instead of dead-ending at a typed-address
+                    // card the owner cannot fill in.
+                    setState(State.DETECTING, "Asking every ECU on the bus...");
+                    publish(null);
+                    java.util.List<String> extra = client.discoverEcus();
+                    extra.removeAll(BmsFields.BMS_CANDIDATES);
+                    if (!extra.isEmpty()) {
+                        found = client.sweepCandidates(extra, msg -> {
+                            setState(State.DETECTING, msg);
+                            publish(null);
+                        });
+                    }
+                    discoveredEcus = (found != null || extra.isEmpty())
+                            ? "" : String.join(", ", extra);
+                }
+                if (found == null) {
                     client.close();
                     boolean carSilent = client.lastDetectAnswered() == 0;
                     if (carSilent && ++silentSweeps < 2) {
@@ -627,6 +659,9 @@ public final class BmsService extends Service {
                     // field - an owner of a model whose BMS neither names itself
                     // nor serves the Nexon's data DIDs may know where it lives.
                     trouble = Trouble.NO_BMS;
+                    // Save what the car said, so the owner of an unrecognised
+                    // model can send the developer facts instead of guesses.
+                    detectReportPath = saveDetectReport(client.detectionLog());
                     fatal(carSilent
                             ? "No answer from the car at any address this app knows"
                             : "Could not find a battery controller on this vehicle");
@@ -694,6 +729,8 @@ public final class BmsService extends Service {
                 }
             }
             trouble = Trouble.NONE;       // whatever went wrong before, this link works
+            discoveredEcus = "";
+            detectReportPath = null;
             setState(State.RUNNING, "Connected");
             publish(null);
             return true;
@@ -793,6 +830,30 @@ public final class BmsService extends Service {
         }
         boolean zero = m.isZeroBased();
         if (zero != prefs.learnedZeroBased()) prefs.setLearnedZeroBased(zero);
+    }
+
+    /**
+     * The detection transcript, saved as a shareable file: address by address,
+     * who answered and what it called itself.
+     */
+    private String saveDetectReport(String log) {
+        try {
+            java.io.File dir = CsvLogger.logsDir(this);
+            //noinspection ResultOfMethodCallIgnored
+            dir.mkdirs();
+            String stamp = new java.text.SimpleDateFormat("yyyyMMdd_HHmmss",
+                    java.util.Locale.US).format(new java.util.Date());
+            java.io.File f = new java.io.File(dir, "detect_" + stamp + ".txt");
+            java.io.FileWriter w = new java.io.FileWriter(f);
+            w.write("Tata EV BMS - detection report\n"
+                    + "No battery controller was identified. Below is every address "
+                    + "probed and what answered.\n\n");
+            w.write(log == null ? "" : log);
+            w.close();
+            return f.getAbsolutePath();
+        } catch (java.io.IOException e) {
+            return null;
+        }
     }
 
     private void pollOnce(ElmClient client) {

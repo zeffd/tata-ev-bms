@@ -908,7 +908,10 @@ public final class MainActivity extends Activity {
         text.setLineSpacing(0, 1.25f);
         troubleBox.addView(text);
         if (t == BmsService.Trouble.NO_BMS) {
+            String extras = BmsService.discoveredEcus();
             text.setText("No battery controller answered at any address this app knows. "
+                    + (extras.isEmpty() ? ""
+                        : "ECUs did answer at: " + extras + " - one of them may be it. ")
                     + "If you know this car's address, enter it (three hex digits, like 785).");
             final EditText addr = new EditText(this);
             addr.setHint("e.g. 785");
@@ -927,6 +930,29 @@ public final class MainActivity extends Activity {
             });
             troubleBox.addView(go, new LinearLayout.LayoutParams(
                     LinearLayout.LayoutParams.MATCH_PARENT, dp(44)));
+            // What the car actually said, as a file - so an owner of an
+            // unrecognised model can send facts instead of guesses.
+            final String report = BmsService.detectReportPath();
+            if (report != null) {
+                TextView share = flatButton("Share detection report", OK, v -> {
+                    android.net.Uri uri = FileSharing.uriFor(this,
+                            new java.io.File(report));
+                    if (uri == null) {
+                        Toast.makeText(this, "Report file is gone",
+                                Toast.LENGTH_SHORT).show();
+                        return;
+                    }
+                    Intent send = new Intent(Intent.ACTION_SEND);
+                    send.setType("text/plain");
+                    send.putExtra(Intent.EXTRA_STREAM, uri);
+                    send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                    startActivity(Intent.createChooser(send, "Share detection report"));
+                });
+                LinearLayout.LayoutParams sl = new LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT, dp(44));
+                sl.setMargins(0, dp(6), 0, 0);
+                troubleBox.addView(share, sl);
+            }
         } else {
             text.setText("This car's battery controller answers, but not with the codes this "
                     + "app knows. Mapping it reads every code the controller serves and "

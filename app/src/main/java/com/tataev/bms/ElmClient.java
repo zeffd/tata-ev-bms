@@ -124,6 +124,8 @@ final class ElmClient {
     private volatile boolean aborted;
     /** How many addresses gave a UDS reply in the last detection sweep. */
     private int lastDetectAnswered;
+    /** Transcript of the last detection, for the shareable report. */
+    private final StringBuilder detectLog = new StringBuilder();
 
     void connect(BluetoothDevice device) throws IOException {
         close();
@@ -299,6 +301,16 @@ final class ElmClient {
     BmsInfo detectBms(java.util.List<String> candidates, ProgressSink progress)
             throws IOException {
         initAdapter();
+        detectLog.setLength(0);
+        return sweepCandidates(candidates, progress);
+    }
+
+    /**
+     * The identification sweep alone, for an adapter that is already
+     * initialised - broadcast discovery re-runs it over the addresses it heard.
+     */
+    BmsInfo sweepCandidates(java.util.List<String> candidates, ProgressSink progress)
+            throws IOException {
         BmsInfo bySupplier = null;
         BmsInfo byContent = null;
         long deadline = SystemClock.elapsedRealtime() + DETECT_BUDGET_MS;
@@ -333,13 +345,17 @@ final class ElmClient {
             }
             if (reply == null || reply.trim().isEmpty()) {
                 silentInARow++;
+                detectLog.append(req).append(": adapter silent\n");
                 continue;
             }
             silentInARow = 0;
             // Only a UDS frame from this address counts as an answer. NO DATA
             // and CAN ERROR are the adapter talking, not the car.
             UdsCodec.Response idReply = UdsCodec.decode22(reply, responseId);
-            if (idReply == null) continue;
+            if (idReply == null) {
+                detectLog.append(req).append(": no UDS reply\n");
+                continue;
+            }
             answered++;
             lastDetectAnswered = answered;
             // Any reply - a name or a refusal - proves an ECU lives here. One
@@ -352,16 +368,23 @@ final class ElmClient {
             // supplier fallback would never match on a Turkish-locale phone.
             String upperName = name == null ? "" : name.toUpperCase(Locale.ROOT);
             String upperSup = supplier == null ? "" : supplier.toUpperCase(Locale.ROOT);
+            detectLog.append(req).append(": answered  name=")
+                     .append(name == null ? "-" : name)
+                     .append("  supplier=").append(supplier == null ? "-" : supplier)
+                     .append('\n');
 
             if (upperName.contains("BMS") || upperName.contains("BATTERY")) {
+                detectLog.append("  ^ identified by name\n");
                 return new BmsInfo(req, responseId, name, supplier == null ? "" : supplier);
             }
             if (bySupplier == null && name != null && (upperSup.contains("GOTION")
                     || upperSup.contains("BMS") || upperSup.contains("CATL")
                     || upperSup.contains("LG"))) {
+                detectLog.append("  ^ battery-vendor supplier\n");
                 bySupplier = new BmsInfo(req, responseId, name, supplier);
             }
             if (bySupplier == null && byContent == null && looksLikeBatteryData()) {
+                detectLog.append("  ^ data looks like a battery\n");
                 byContent = new BmsInfo(req, responseId, name == null ? "" : name,
                         supplier == null ? "" : supplier);
             }
@@ -376,6 +399,46 @@ final class ElmClient {
      */
     int lastDetectAnswered() {
         return lastDetectAnswered;
+    }
+
+    /** What the last detection saw, address by address. */
+    String detectionLog() {
+        return detectLog.toString();
+    }
+
+    /**
+     * Ask the WHOLE bus who is there: functional-broadcast probes to 0x7DF
+     * with the receive filter open. Every UDS-capable ECU that answers reveals
+     * its CAN id, and the ids are the whole yield. Both probes fit a single
+     * frame each way (TesterPresent, and a one-byte identification DID), so no
+     * ISO-TP flow control is ever involved. Pure reads, same guard as
+     * everything else.
+     *
+     * @return request ids (response - 8) heard, deduplicated; empty on failure
+     */
+    java.util.List<String> discoverEcus() {
+        java.util.List<String> ids = new java.util.ArrayList<>();
+        try {
+            raw("ATCRA", 2000);          // open the filter: hear everyone
+            raw("ATSH7DF", 2000);
+            for (String probe : new String[]{"3E00", "22F186"}) {
+                String text;
+                try {
+                    text = raw(probe, 2500);
+                } catch (IOException e) {
+                    continue;
+                }
+                for (String resp : UdsCodec.respondingIds(text)) {
+                    String req = UdsCodec.requestIdFor(resp);
+                    if (req != null && !ids.contains(req)) ids.add(req);
+                }
+            }
+        } catch (IOException ignored) {
+            // a failed discovery just means no extra candidates
+        }
+        detectLog.append("broadcast heard: ")
+                 .append(ids.isEmpty() ? "nothing" : ids.toString()).append('\n');
+        return ids;
     }
 
     /**

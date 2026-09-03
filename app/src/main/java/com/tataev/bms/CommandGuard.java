@@ -39,6 +39,8 @@ final class CommandGuard {
             "ATCAF1",       // CAN auto-formatting on
             "ATSP6",        // ISO 15765-4, CAN 11-bit, 500 kbaud
             "ATAT1",        // adaptive timing
+            "ATCRA",        // bare = CLEAR the receive filter - hear every ECU
+                            // during broadcast discovery (adapter-local)
             "ATFCSD300000", // flow-control data
             "ATFCSM1",      // flow-control mode
     };
