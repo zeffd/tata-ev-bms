@@ -1,0 +1,105 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Legacy Bluetooth permissions (Android 11 and below) -->
+    <uses-permission android:name="android.permission.BLUETOOTH"
+        android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN"
+        android:maxSdkVersion="30" />
+    <!-- Android 12+ runtime Bluetooth permission. BLUETOOTH_SCAN is deliberately
+         NOT declared: this app never discovers devices. It reads the bonded list
+         and opens RFCOMM to an adapter the user has already paired, so asking for
+         a scan permission would be requesting something adjacent to location for
+         no reason. -->
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- Alerts vibrate as well as sound: the phone is often in a pocket or a
+         cradle with the volume down. A normal permission, no prompt. -->
+    <uses-permission android:name="android.permission.VIBRATE" />
+
+    <!-- Signature-level, so only this app (same signing key) can send or hear
+         the dashboard-update broadcast. RECEIVER_NOT_EXPORTED only exists from
+         API 34; below it a plain receiver is public, and any co-installed app
+         could pop spoofed alert toasts over the dashboard. -->
+    <permission android:name="com.tataev.bms.permission.UPDATES"
+        android:protectionLevel="signature" />
+    <uses-permission android:name="com.tataev.bms.permission.UPDATES" />
+
+    <uses-feature android:name="android.hardware.bluetooth" android:required="true" />
+
+    <!-- allowBackup is OFF deliberately: the preferences hold a detected BMS
+         address and a per-vehicle current calibration, and a device restore would
+         carry one car's values onto another, where they are silently wrong. -->
+    <application
+        android:label="Tata EV BMS"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:theme="@android:style/Theme.Material.NoActionBar"
+        android:allowBackup="false"
+        android:fullBackupContent="false">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:screenOrientation="portrait"
+            android:label="Tata EV BMS">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- Portrait-locked like the other two screens. Every view here is built
+             in code with no id, so the framework cannot save or restore field
+             contents: a rotation mid-edit silently discarded a typed BMS address
+             and current scale. -->
+        <activity
+            android:name=".SettingsActivity"
+            android:exported="false"
+            android:screenOrientation="portrait"
+            android:label="Settings" />
+
+        <activity
+            android:name=".ScanActivity"
+            android:exported="false"
+            android:screenOrientation="portrait"
+            android:label="Scan vehicle" />
+
+        <activity
+            android:name=".LogsActivity"
+            android:exported="false"
+            android:screenOrientation="portrait"
+            android:label="Logs" />
+
+        <!-- Serves both a saved CSV and the session in progress; which one is
+             decided by whether a log path came in on the intent. -->
+        <activity
+            android:name=".PackMapActivity"
+            android:exported="false"
+            android:screenOrientation="portrait"
+            android:label="Pack map" />
+
+        <!-- Every saved log replayed and its verdicts tallied per group. -->
+        <activity
+            android:name=".PackHistoryActivity"
+            android:exported="false"
+            android:screenOrientation="portrait"
+            android:label="All drives" />
+
+        <!-- Serves log files to share targets; read-only, logs dir only. -->
+        <provider
+            android:name=".LogFileProvider"
+            android:authorities="com.tataev.bms.files"
+            android:exported="false"
+            android:grantUriPermissions="true" />
+
+        <service
+            android:name=".BmsService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
+    </application>
+</manifest>

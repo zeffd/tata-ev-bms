@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Single-colour layer for Android 13 themed icons: the launcher tints it to the
+  wallpaper palette, so the red cue is lost but the shape - and the one lower
+  cell - stays. Ignored below API 33.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- terminal posts: the car-battery cue a single-nub phone battery lacks -->
+    <path android:fillColor="#FFFFFF" android:pathData="M33,41 v-6 a2.5,2.5 0 0 1 2.5,-2.5 h9 a2.5,2.5 0 0 1 2.5,2.5 v6 z M61,41 v-6 a2.5,2.5 0 0 1 2.5,-2.5 h9 a2.5,2.5 0 0 1 2.5,2.5 v6 z" />
+
+    <!-- body -->
+    <path
+        android:pathData="M35,41 h38 a8,8 0 0 1 8,8 v16 a8,8 0 0 1 -8,8 h-38 a8,8 0 0 1 -8,-8 v-16 a8,8 0 0 1 8,-8 z"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="5.5"
+        android:strokeLineJoin="round" />
+
+    <path android:fillColor="#FFFFFF" android:pathData="M35,47 h5 a2,2 0 0 1 2,2 v16 a2,2 0 0 1 -2,2 h-5 a2,2 0 0 1 -2,-2 v-16 a2,2 0 0 1 2,-2 z" />
+    <path android:fillColor="#FFFFFF" android:pathData="M47,47 h5 a2,2 0 0 1 2,2 v16 a2,2 0 0 1 -2,2 h-5 a2,2 0 0 1 -2,-2 v-16 a2,2 0 0 1 2,-2 z" />
+    <!-- the weak cell: lower, and red -->
+    <path android:fillColor="#FFFFFF" android:pathData="M59,55 h5 a2,2 0 0 1 2,2 v8 a2,2 0 0 1 -2,2 h-5 a2,2 0 0 1 -2,-2 v-8 a2,2 0 0 1 2,-2 z" />
+    <path android:fillColor="#FFFFFF" android:pathData="M71,47 h5 a2,2 0 0 1 2,2 v16 a2,2 0 0 1 -2,2 h-5 a2,2 0 0 1 -2,-2 v-16 a2,2 0 0 1 2,-2 z" />
+</vector>

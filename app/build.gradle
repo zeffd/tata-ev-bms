@@ -1,0 +1,49 @@
+plugins { id "com.android.application" }
+
+android {
+    namespace "com.tataev.bms"
+    compileSdk 35
+
+    defaultConfig {
+        applicationId "com.tataev.bms"
+        minSdk 24
+        targetSdk 35
+        versionCode 34
+        versionName "3.18"
+    }
+
+    buildTypes {
+        release {
+            // Both of these are deliberate for a SIDELOADED diagnostic tool, and
+            // both must change before this goes anywhere else:
+            //
+            //  * minifyEnabled false - a 70 KB APK gains almost nothing from R8,
+            //    and an obfuscated stack trace from a car park is worth less than
+            //    the few KB saved.
+            //  * signingConfig debug - lets a release build install straight from
+            //    `adb install` with no keystore ceremony. It also means every
+            //    machine that builds this produces a DIFFERENT signature, so a
+            //    rebuild elsewhere forces an uninstall, taking the logs with it.
+            //
+            // For distribution: a real keystore, and minify with a keep rule for
+            // anything reached reflectively.
+            minifyEnabled false
+            signingConfig signingConfigs.debug
+        }
+    }
+
+    // lintVital needs to fetch lint-gradle; skip it so the build works offline.
+    lint {
+        checkReleaseBuilds false
+        abortOnError false
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+// No AndroidX / no Compose: the framework classes cover everything this app needs,
+// which keeps the whole APK under 100 KB.
+dependencies { }
