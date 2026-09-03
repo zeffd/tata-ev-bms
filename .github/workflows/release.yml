@@ -1,0 +1,49 @@
+  # Builds and publishes the APK whenever a version tag (v1.0, v1.1, ...) is
+  # pushed: the pure-logic self-test gates the build, then the release APK is
+  # attached to the GitHub release for that tag.
+  #
+  # The release build is debug-signed on purpose (see app/build.gradle): this is
+  # a sideloaded diagnostic tool, and a keystore-less build installs straight
+  # from `adb install`. The GitHub runner generates its own debug keystore, so
+  # every release is signed with a DIFFERENT key than your local builds -
+  # switching between the two on a phone needs one uninstall (which removes the
+  # on-device logs; share them first).
+  name: Release APK
+
+  on:
+    push:
+      tags: ["v*"]
+
+  permissions:
+    contents: write
+
+  jobs:
+    build:
+      runs-on: ubuntu-latest
+      steps:
+        - uses: actions/checkout@v4
+
+        - uses: actions/setup-java@v4
+          with:
+            distribution: temurin
+            java-version: "17"
+
+        # Pure javac/java, no Android SDK needed - the fast gate. Invoked via
+        # bash because a web-uploaded repo loses the executable bits.
+        - name: Self-test
+          run: bash run-selftest.sh
+
+        # ANDROID_HOME is preinstalled on the ubuntu runners.
+        - name: Build release APK
+          run: |
+            chmod +x gradlew
+            ./gradlew --no-daemon assembleRelease
+
+        - name: Name the APK after the tag
+          run: cp app/build/outputs/apk/release/app-release.apk "TataEvBMS-${GITHUB_REF_NAME#v}.apk"
+
+        - name: Attach APK to the GitHub release
+          uses: softprops/action-gh-release@v2
+          with:
+            files: TataEvBMS-*.apk
+            generate_release_notes: true
