@@ -1,0 +1,10 @@
+gitignore
+# build outputs
+build/
+.gradle/
+*.apk
+
+# local machine (SDK path carries a username)
+local.properties
+# macOS
+.DS_Store
