@@ -206,7 +206,7 @@ public final class ScanActivity extends Activity {
         root.addView(share);
 
         Button reset = new Button(this);
-        reset.setText("Reset to default DIDs");
+        reset.setText("Reset to default DIDs and scales");
         reset.setOnClickListener(v -> {
             // Same gate as the Apply buttons: clearing overrides mid-session
             // remaps the poll while the open CSV's header still names the old
@@ -344,12 +344,15 @@ public final class ScanActivity extends Activity {
 
             String bmsId = prefs.bmsRequestId();
             boolean detected = false;
+            elm.useProtocol(ProtocolLadder.atspForId(bmsId, prefs.bmsProtocol()));
             if (bmsId == null || bmsId.isEmpty()) {
                 setStatus("Locating BMS...");
                 ElmClient.BmsInfo info = elm.detectBms(BmsFields.BMS_CANDIDATES,
                         msg -> setStatus(msg));
                 if (info == null) {
-                    setStatus("Could not find a BMS");
+                    setStatus("Could not find a BMS on 11-bit CAN. Connect from the "
+                            + "dashboard first - it searches every protocol and saves "
+                            + "what it finds - then scan.");
                     return;
                 }
                 bmsId = info.requestId;
@@ -466,8 +469,12 @@ public final class ScanActivity extends Activity {
                             scanner.linkLostAtDid())
                     : "Scan complete";
             try {
+                String when = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.ROOT)
+                        .format(new java.util.Date());
+                String preamble = String.format(Locale.ROOT, "Scanned: %04X-%04X\nWhen: %s\nApp: %s\n",
+                        from, to, when, CsvLogger.appVersion(this)) + elm.caps().report();
                 lastReport = DidScanner.writeReport(
-                        CsvLogger.logsDir(this), usedId, hits, suggestion, analysis,
+                        CsvLogger.logsDir(this), usedId, preamble, hits, suggestion, analysis,
                         scanner.linkLost()
                                 ? String.format(Locale.ROOT,
                                         "LINK LOST at DID %04X - PARTIAL RESULTS: every "
@@ -505,7 +512,11 @@ public final class ScanActivity extends Activity {
 
     private void showResults(List<DidScanner.Hit> hits, Map<String, String> suggestion,
                              boolean cancelled) {
-        if (isFinishing() || (android.os.Build.VERSION.SDK_INT >= 17 && isDestroyed())) {
+        // isFinishing() alone misses a recreation (dark mode, font scale, a fold):
+        // the old instance is destroyed with isFinishing() false. Same test as
+        // MapScreen.gone(); the SDK_INT >= 17 guard it used to carry was dead at
+        // minSdk 24.
+        if (isFinishing() || isDestroyed()) {
             // The Activity went away mid-sweep. The results are already in the
             // static store, so the next instance picks them up in onCreate.
             return;
@@ -624,6 +635,9 @@ public final class ScanActivity extends Activity {
     private void showHypotheses() {
         hypothesisBox.removeAllViews();
         showIndexChoice();
+        // BEFORE the early return: a scan that found no voltage reading at all is
+        // exactly the case a whole-percent SOC choice exists for.
+        showSocChoice();
         if (lastHypotheses == null || lastHypotheses.isEmpty()) return;
 
         TextView head = new TextView(this);
@@ -654,9 +668,103 @@ public final class ScanActivity extends Activity {
                 m.put("cell_max_mv", h.cellMaxDid);
                 m.put("cell_min_mv", h.cellMinDid);
                 if (applyOverrides(m)) {
+                    // The unit travels with the choice: a 10 mV controller's
+                    // cells decode to millivolts through a scale override, so
+                    // every downstream role keeps reading mV.
+                    String cellScale = h.cellUnitMv == 10 ? "10;0;2" : "";
+                    prefs.setScaleOverride("cell_max_mv", cellScale);
+                    prefs.setScaleOverride("cell_min_mv", cellScale);
+                    prefs.setScaleOverride("pack_v", "");
                     Toast.makeText(this, String.format(Locale.ROOT,
-                            "Set pack=%s, max=%s, min=%s (%.0f groups)",
-                            h.packDid, h.cellMaxDid, h.cellMinDid, h.series),
+                            "Set pack=%s, max=%s, min=%s (%.0f groups%s)",
+                            h.packDid, h.cellMaxDid, h.cellMinDid, h.series,
+                            h.cellUnitMv == 10 ? ", cells in 10 mV" : ""),
+                            Toast.LENGTH_LONG).show();
+                }
+            });
+            hypothesisBox.addView(b);
+        }
+    }
+
+    /**
+     * Offer SOC candidates when no tenths SOC was suggested. A parked car's SOC
+     * neither moves nor reads in tenths on every model, and the one person who
+     * knows the right number is looking at the dash.
+     *
+     * Two lists, because a 2-byte SOC can be either unit. The whole-percent one
+     * is the common case. Under it go the DIDs the voltage search set aside as
+     * pack or cell voltages: pack volts, 10 mV cells and a tenths SOC are all
+     * 2-byte counts in overlapping ranges, so the rule that stops a moving cell
+     * being named "SOC 32.5 %" can also catch a genuine SOC reading like one.
+     * Without this second list that owner has no SOC and nothing on the screen
+     * able to set it - see DidScanner.socCandidatesTenths.
+     */
+    private void showSocChoice() {
+        if (lastSuggestion == null || lastSuggestion.containsKey("soc_pct")) return;
+        if (lastResultHits == null) return;
+        List<DidScanner.Hit> soc = DidScanner.socCandidates(lastResultHits, lastSuggestion);
+        List<DidScanner.Hit> tenths = DidScanner.socCandidatesTenths(
+                lastResultHits, lastHypotheses, lastSuggestion);
+        if (soc.isEmpty() && tenths.isEmpty()) return;
+
+        TextView head = new TextView(this);
+        head.setText("Which of these is the dash's charge percentage?");
+        head.setTextColor(Palette.OK);
+        head.setTextSize(14);
+        head.setTypeface(Typeface.DEFAULT_BOLD);
+        head.setPadding(0, dp(16), 0, dp(4));
+        hypothesisBox.addView(head);
+
+        if (!soc.isEmpty()) {
+            TextView why = new TextView(this);
+            why.setText("No tenths-of-a-percent SOC was found. These read 0-100 and may be "
+                    + "the charge in whole percent - pick the one matching the dash.");
+            why.setTextColor(Palette.MUTED);
+            why.setTextSize(11);
+            hypothesisBox.addView(why);
+        }
+
+        for (DidScanner.Hit h : soc) {
+            Button b = new Button(this);
+            b.setAllCaps(false);
+            b.setTextSize(12);
+            b.setText(h.did + " = " + h.first() + " %" + (h.changed() ? "  (moved)" : ""));
+            b.setOnClickListener(v -> {
+                if (refuseWhileLive()) return;
+                Map<String, String> m = new java.util.LinkedHashMap<>();
+                m.put("soc_pct", h.did);
+                if (applyOverrides(m)) {
+                    prefs.setScaleOverride("soc_pct", "1;0;" + h.length);
+                    Toast.makeText(this, "SOC = " + h.did + " in whole percent",
+                            Toast.LENGTH_LONG).show();
+                }
+            });
+            hypothesisBox.addView(b);
+        }
+
+        if (tenths.isEmpty()) return;
+        TextView also = new TextView(this);
+        also.setText("Or in tenths of a percent - these were set aside as a pack or cell "
+                + "voltage, which reads the same numerically. Pick one only if it "
+                + "matches the dash.");
+        also.setTextColor(Palette.MUTED);
+        also.setTextSize(11);
+        also.setPadding(0, dp(8), 0, 0);
+        hypothesisBox.addView(also);
+
+        for (DidScanner.Hit h : tenths) {
+            Button b = new Button(this);
+            b.setAllCaps(false);
+            b.setTextSize(12);
+            b.setText(String.format(Locale.ROOT, "%s = %.1f %% (tenths)",
+                    h.did, h.first() / 10.0));
+            b.setOnClickListener(v -> {
+                if (refuseWhileLive()) return;
+                Map<String, String> m = new java.util.LinkedHashMap<>();
+                m.put("soc_pct", h.did);
+                if (applyOverrides(m)) {
+                    prefs.setScaleOverride("soc_pct", "0.1;0;2");
+                    Toast.makeText(this, "SOC = " + h.did + " in tenths of a percent",
                             Toast.LENGTH_LONG).show();
                 }
             });

@@ -68,6 +68,10 @@ final class Prefs {
         if (bmsRequestIdIsUserEntered()) {
             d.append(d.length() > 0 ? ", " : "").append("a typed battery controller address");
         }
+        if (!presetName().isEmpty()) {
+            d.append(d.length() > 0 ? ", " : "").append("the ").append(presetName())
+             .append(" battery map");
+        }
         return d.toString();
     }
 
@@ -250,6 +254,8 @@ final class Prefs {
           .putString(pfx() + KEY_BMS_REQUEST,
                   id == null ? "" : id.trim().toUpperCase(Locale.ROOT))
           .putBoolean(pfx() + KEY_BMS_REQUEST + "_user", userEntered)
+          .putString(pfx() + "bms_protocol",
+                  id == null || id.trim().isEmpty() ? "" : sp.getString(pfx() + "bms_protocol", ""))
           .apply();
     }
 
@@ -259,6 +265,15 @@ final class Prefs {
 
     boolean bmsRequestIdIsUserEntered() {
         return sp.getBoolean(pfx() + KEY_BMS_REQUEST + "_user", false);
+    }
+
+    /** The ATSP command the saved address answered on; "" = the default, ATSP6. */
+    String bmsProtocol() {
+        return sp.getString(pfx() + "bms_protocol", "");
+    }
+
+    void setBmsProtocol(String atsp) {
+        sp.edit().putString(pfx() + "bms_protocol", atsp == null ? "" : atsp.trim()).apply();
     }
 
     String adapterName() {
@@ -282,14 +297,47 @@ final class Prefs {
         sp.edit().putString(pfx() + "did_override_" + roleKey, v).apply();
     }
 
+    /** Per-role decoding override, "factor;offset;width"; "" = the built-in kind. */
+    String scaleOverride(String roleKey) {
+        return sp.getString(pfx() + "scale_override_" + roleKey, "");
+    }
+
+    void setScaleOverride(String roleKey, String encoded) {
+        sp.edit().putString(pfx() + "scale_override_" + roleKey,
+                encoded == null ? "" : encoded.trim()).apply();
+    }
+
+    /** The battery-map preset applied to this car, or "". Shown, never decided from. */
+    String presetName() {
+        return sp.getString(pfx() + "preset_name", "");
+    }
+
+    void setPresetName(String name) {
+        sp.edit().putString(pfx() + "preset_name", name == null ? "" : name).apply();
+    }
+
+    /**
+     * Was anything on this profile's battery map set by hand or by an earlier
+     * preset? Any DID override, any scale override, or a preset name.
+     *
+     * The scan itself lives in {@link ProfileMatch#anyMapping} - pure, so the
+     * self-test can pin the prefix arithmetic this half of the preset gate
+     * depends on. All this method contributes is the Android state.
+     */
+    boolean hasAnyOverride() {
+        return ProfileMatch.anyMapping(sp.getAll(), pfx(), presetName());
+    }
+
     void clearAllDidOverrides() {
         SharedPreferences.Editor e = sp.edit();
         // pfx() for profile 1 is "", and "p2_did_override_x" does not start
         // with "did_override_", so each profile's clear stays its own.
         String p = pfx() + "did_override_";
+        String s = pfx() + "scale_override_";
         for (String k : sp.getAll().keySet()) {
-            if (k.startsWith(p)) e.remove(k);
+            if (k.startsWith(p) || k.startsWith(s)) e.remove(k);
         }
+        e.remove(pfx() + "preset_name");
         e.apply();
     }
 

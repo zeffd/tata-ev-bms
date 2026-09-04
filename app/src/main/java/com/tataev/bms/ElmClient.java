@@ -39,6 +39,44 @@ final class ElmClient {
     private volatile OutputStream out;
     private String responseId = "78D";
 
+    /**
+     * The protocol-select command in force; applied by initAdapter() and
+     * switchProtocol().
+     *
+     * ATSP6 by default, and ATSP deliberately: 11-bit CAN at 500 kbaud is what
+     * every Tata EV this app was written on uses, it is the adapter's own
+     * sensible default, and persisting it to the dongle's EEPROM changes nothing
+     * about what the next tool sees. Every rung the LADDER probes with is an
+     * ATTP instead - see ProtocolLadder - so a failed detection never leaves the
+     * dongle defaulting to 29-bit or 250 kbaud. Always set explicitly here, so
+     * nothing depends on what the adapter remembers.
+     */
+    private String protocol = "ATSP6";
+    /** Hex digits in a printed CAN id under that protocol: 3 or 8. */
+    private int idLen = 3;
+
+    /** Choose the protocol the NEXT initAdapter() will set. */
+    void useProtocol(String atsp) {
+        ProtocolLadder.Rung r = ProtocolLadder.forProtocol(atsp);
+        protocol = r.atsp;
+        idLen = r.idLen;
+    }
+
+    /** Change protocol on a live, initialised adapter - the ladder's step. */
+    void switchProtocol(String atsp) throws IOException {
+        useProtocol(atsp);
+        at(protocol, 2000);
+    }
+
+    String protocol() {
+        return protocol;
+    }
+
+    /** A line for the detection transcript, e.g. which rung is being tried. */
+    void noteInLog(String line) {
+        detectLog.append(line).append('\n');
+    }
+
     boolean isConnected() {
         BluetoothSocket s = socket;
         return s != null && s.isConnected();
@@ -127,9 +165,34 @@ final class ElmClient {
     /** Transcript of the last detection, for the shareable report. */
     private final StringBuilder detectLog = new StringBuilder();
 
+    /** What the adapter answered during setup, for the report headers. */
+    private final AdapterCaps caps = new AdapterCaps();
+
+    AdapterCaps caps() {
+        return caps;
+    }
+
+    /**
+     * Send an adapter command and record whether it was accepted. A "?" is a
+     * capability the adapter lacks, never a failure: the software already
+     * filters replies by CAN id when the receive filter cannot be set, and
+     * already surfaces partial multi-frame replies when flow control is missing.
+     */
+    private String at(String cmd, long timeoutMs) throws IOException {
+        String reply = raw(cmd, timeoutMs);
+        caps.note(cmd, reply);
+        return reply;
+    }
+
     void connect(BluetoothDevice device) throws IOException {
         close();
-        aborted = false;
+        // aborted is NOT cleared here. It is set only by abort(), whose one
+        // caller is BmsService.onDestroy - the service is going away and the
+        // worker is being joined, so nothing legitimately connects again on this
+        // client. Clearing it re-armed the reflective fallback for an abort that
+        // landed just BEFORE this call, opening a second uninterruptible socket
+        // and keeping the dead worker and its wake lock alive for another
+        // 5-20 s. Once set, it stays set.
         try {
             socket = device.createRfcommSocketToServiceRecord(SPP);
             socket.connect();
@@ -227,14 +290,15 @@ final class ElmClient {
 
     /** Adapter setup only; addressing is chosen separately. */
     void initAdapter() throws IOException {
-        raw("ATZ", 6000);
-        raw("ATE0", 2000);
-        raw("ATL0", 2000);
-        raw("ATS0", 2000);
-        raw("ATH1", 2000);      // headers on: we must see which ECU replied
-        raw("ATCAF1", 2000);
-        raw("ATSP6", 2000);     // ISO 15765-4, CAN 11-bit, 500 kbaud
-        raw("ATAT1", 2000);
+        caps.reset();
+        caps.noteBanner(raw("ATZ", 6000));   // the banner names the chip - or the clone
+        at("ATE0", 2000);
+        at("ATL0", 2000);
+        at("ATS0", 2000);
+        at("ATH1", 2000);      // headers on: we must see which ECU replied
+        at("ATCAF1", 2000);
+        at(protocol, 2000);    // ISO 15765-4; ATSP6 unless the ladder chose otherwise
+        at("ATAT1", 2000);
     }
 
     /**
@@ -269,7 +333,7 @@ final class ElmClient {
      */
     boolean enterExtendedSession() throws IOException {
         String text = raw("1003", 4000);
-        byte[] p = UdsCodec.reassemble(text, 3).get(responseId);
+        byte[] p = UdsCodec.reassemble(text, idLen).get(responseId);
         return p != null && p.length > 0 && (p[0] & 0xFF) == 0x50;
     }
 
@@ -279,12 +343,19 @@ final class ElmClient {
         final String responseId;
         final String systemName;
         final String supplier;
+        /** The ATSP rung this address answered on, so it can be saved and reopened. */
+        final String protocol;
+        /** Which DID block its data lives in: "34xx", "30xx", or null if unknown. */
+        final String dialect;
 
-        BmsInfo(String requestId, String responseId, String systemName, String supplier) {
+        BmsInfo(String requestId, String responseId, String systemName, String supplier,
+                String protocol, String dialect) {
             this.requestId = requestId;
             this.responseId = responseId;
             this.systemName = systemName;
             this.supplier = supplier;
+            this.protocol = protocol;
+            this.dialect = dialect;
         }
     }
 
@@ -375,18 +446,23 @@ final class ElmClient {
 
             if (upperName.contains("BMS") || upperName.contains("BATTERY")) {
                 detectLog.append("  ^ identified by name\n");
-                return new BmsInfo(req, responseId, name, supplier == null ? "" : supplier);
+                return new BmsInfo(req, responseId, name, supplier == null ? "" : supplier,
+                        protocol, batteryDialect());
             }
             if (bySupplier == null && name != null && (upperSup.contains("GOTION")
                     || upperSup.contains("BMS") || upperSup.contains("CATL")
                     || upperSup.contains("LG"))) {
                 detectLog.append("  ^ battery-vendor supplier\n");
-                bySupplier = new BmsInfo(req, responseId, name, supplier);
+                bySupplier = new BmsInfo(req, responseId, name, supplier, protocol,
+                        batteryDialect());
             }
-            if (bySupplier == null && byContent == null && looksLikeBatteryData()) {
-                detectLog.append("  ^ data looks like a battery\n");
-                byContent = new BmsInfo(req, responseId, name == null ? "" : name,
-                        supplier == null ? "" : supplier);
+            if (bySupplier == null && byContent == null) {
+                String dialect = batteryDialect();
+                if (dialect != null) {
+                    detectLog.append("  ^ data looks like a battery (").append(dialect).append(" block)\n");
+                    byContent = new BmsInfo(req, responseId, name == null ? "" : name,
+                            supplier == null ? "" : supplier, protocol, dialect);
+                }
             }
         }
         return bySupplier != null ? bySupplier : byContent;
@@ -407,54 +483,105 @@ final class ElmClient {
     }
 
     /**
-     * Ask the WHOLE bus who is there: functional-broadcast probes to 0x7DF
-     * with the receive filter open. Every UDS-capable ECU that answers reveals
-     * its CAN id, and the ids are the whole yield. Both probes fit a single
-     * frame each way (TesterPresent, and a one-byte identification DID), so no
-     * ISO-TP flow control is ever involved. Pure reads, same guard as
-     * everything else.
+     * Ask the WHOLE bus who is there: functional-broadcast probes with the
+     * receive filter open. Every UDS-capable ECU that answers reveals its CAN
+     * id, and the ids are the whole yield. Both probes fit a single frame each
+     * way, so no ISO-TP flow control is ever involved. Pure reads, same guard.
      *
-     * @return request ids (response - 8) heard, deduplicated; empty on failure
+     * @param functionalIds broadcast request ids for the protocol in force -
+     *                      7DF at 11-bit; 18DB33F1 and Tata's 1BDB33F1 at 29-bit
+     * @return request ids heard, deduplicated; empty on failure
      */
-    java.util.List<String> discoverEcus() {
+    java.util.List<String> discoverEcus(java.util.List<String> functionalIds) {
         java.util.List<String> ids = new java.util.ArrayList<>();
-        try {
-            raw("ATCRA", 2000);          // open the filter: hear everyone
-            raw("ATSH7DF", 2000);
-            for (String probe : new String[]{"3E00", "22F186"}) {
-                String text;
-                try {
-                    text = raw(probe, 2500);
-                } catch (IOException e) {
-                    continue;
+        for (String fid : functionalIds) {
+            try {
+                at("ATCRA", 2000);          // open the filter: hear everyone
+                // A clone that refuses ATCRA is still behind whatever window the
+                // last target() left, so it would hear ONE ECU answer the
+                // broadcast and report the bus as nearly empty. The mask does
+                // the same job one level down: all-zero bits means "compare
+                // nothing", i.e. accept every id. Same allowlisted ATCM as
+                // target()'s fallback, only fully open rather than one address.
+                if (!caps.supports("ATCRA")) {
+                    at("ATCM" + (idLen == 8 ? "00000000" : "000"), 2000);
                 }
-                for (String resp : UdsCodec.respondingIds(text)) {
-                    String req = UdsCodec.requestIdFor(resp);
-                    if (req != null && !ids.contains(req)) ids.add(req);
+                setHeader(fid);
+                for (String probe : new String[]{"3E00", "22F186"}) {
+                    String text;
+                    try {
+                        text = raw(probe, 2500);
+                    } catch (IOException e) {
+                        continue;
+                    }
+                    for (String resp : UdsCodec.respondingIds(text, idLen)) {
+                        String req = UdsCodec.requestIdFor(resp);
+                        if (req != null && !ids.contains(req)) ids.add(req);
+                    }
                 }
+            } catch (IOException ignored) {
+                // a failed discovery just means no extra candidates
             }
-        } catch (IOException ignored) {
-            // a failed discovery just means no extra candidates
         }
-        detectLog.append("broadcast heard: ")
+        detectLog.append("broadcast heard (").append(protocol).append("): ")
                  .append(ids.isEmpty() ? "nothing" : ids.toString()).append('\n');
         return ids;
     }
 
+    java.util.List<String> discoverEcus() {
+        return discoverEcus(ProtocolLadder.forProtocol(protocol).functional);
+    }
+
+    /** Reply widths from the last dialect probe, for Presets.identify30xx. */
+    private int lastSocLen, lastIdxLen;
+
+    int lastSocLen() {
+        return lastSocLen;
+    }
+
+    int lastIdxLen() {
+        return lastIdxLen;
+    }
+
     /**
-     * Does this ECU serve a plausible state of charge and pack voltage on the
-     * known DIDs? Content, not name: two reads, both harmless.
+     * Which DID block serves plausible battery data here: "34xx" (Gotion, the
+     * Nexon's), "30xx" (TacoGotion / CESL / Kratos), or null. Content, not name:
+     * two or three reads per block, all harmless.
      */
-    private boolean looksLikeBatteryData() {
+    private String batteryDialect() {
+        if (plausibleBattery("3402", "3400")) return "34xx";
+        if (plausibleBattery("300F", "300D")) {
+            try {
+                UdsCodec.Response idx = readDid("3019");
+                lastIdxLen = idx != null && idx.isData() ? idx.data.length : 1;
+            } catch (IOException e) {
+                lastIdxLen = 1;
+            }
+            return "30xx";
+        }
+        return null;
+    }
+
+    private boolean plausibleBattery(String socDid, String packDid) {
         try {
-            UdsCodec.Response soc = readDid("3402");
-            UdsCodec.Response pack = readDid("3400");
+            UdsCodec.Response soc = readDid(socDid);
+            UdsCodec.Response pack = readDid(packDid);
             if (soc == null || pack == null || !soc.isData() || !pack.isData()) return false;
-            if (soc.data.length != 2 || pack.data.length != 2) return false;
-            int s = ((soc.data[0] & 0xFF) << 8) | (soc.data[1] & 0xFF);
+            if (pack.data.length != 2) return false;
             int p = ((pack.data[0] & 0xFF) << 8) | (pack.data[1] & 0xFF);
-            // SOC in tenths of a percent; pack volts in tenths, 200-500 V.
-            return s <= 1000 && p >= 2000 && p <= 5000;
+            int s;
+            if (soc.data.length == 2) s = ((soc.data[0] & 0xFF) << 8) | (soc.data[1] & 0xFF);
+            else if (soc.data.length == 1) s = soc.data[0] & 0xFF;
+            else return false;
+            // SOC: tenths in two bytes (0..1000) or halves in one (0..200). Pack
+            // volts: raw 800..9000. At 0.1 V/count that is 80..900 V; the floor
+            // is low so the Kratos controller's 0.25 V/count (350 V = raw 1400)
+            // passes too. No Tata pack sits between 80 and 150 V, so the lower
+            // floor admits nothing new.
+            boolean socOk = soc.data.length == 2 ? s <= 1000 : s <= 200;
+            if (!socOk || p < 800 || p > 9000) return false;
+            lastSocLen = soc.data.length;
+            return true;
         } catch (IOException e) {
             return false;
         }
@@ -491,7 +618,7 @@ final class ElmClient {
         try {
             String text = raw("22" + did, 1500);
             return text != null && !text.trim().isEmpty()
-                    && UdsCodec.reassemble(text, 3).containsKey(responseId);
+                    && UdsCodec.reassemble(text, idLen).containsKey(responseId);
         } catch (IOException e) {
             return false;
         }
@@ -503,16 +630,32 @@ final class ElmClient {
     }
 
     void target(String requestHeader) throws IOException {
-        int req = Integer.parseInt(requestHeader, 16);
-        // Locale.ROOT: under a locale with a non-Latin numbering system (ar-EG,
-        // for one) %X emits Arabic-Indic digits, and the response id would then
-        // never match the ASCII CAN id the adapter prints - every reply dropped.
-        responseId = String.format(Locale.ROOT, "%03X", req + 8);
-        raw("ATSH " + requestHeader, 2000);
-        raw("ATCRA " + responseId, 2000);
-        raw("ATFCSH " + requestHeader, 2000);
-        raw("ATFCSD 300000", 2000);
-        raw("ATFCSM1", 2000);
+        String resp = UdsCodec.responseIdFor(requestHeader);
+        if (resp == null) throw new IOException("bad request id: " + requestHeader);
+        responseId = resp;
+        setHeader(requestHeader);
+        at("ATCRA" + responseId, 2000);
+        at("ATFCSH" + requestHeader, 2000);
+        at("ATFCSD300000", 2000);
+        at("ATFCSM1", 2000);
+        // A clone that refused ATCRA may still be sitting behind its factory
+        // 7E8-7EF receive window, in which case a 78D reply is never printed and
+        // there is nothing for the software id filter to filter. ATCM/ATCF have
+        // been in the ELM327 since v1.0 and do the same job one level down.
+        if (!caps.supports("ATCRA")) {
+            at("ATCM" + (responseId.length() == 8 ? "1FFFFFFF" : "7FF"), 2000);
+            at("ATCF" + responseId, 2000);
+        }
+    }
+
+    /** 29-bit ids go out as priority byte + 24-bit header: the form every ELM327 accepts. */
+    private void setHeader(String id) throws IOException {
+        if (id.length() == 8) {
+            at("ATCP" + id.substring(0, 2), 2000);
+            at("ATSH" + id.substring(2), 2000);
+        } else {
+            at("ATSH" + id, 2000);
+        }
     }
 
     /** The CAN id this session's target replies on; used to validate replies. */
@@ -593,7 +736,7 @@ final class ElmClient {
 
         // raw() returns "" on a silent link rather than throwing, so distinguish
         // "nothing came back" from "the ECU replied but we cannot split it".
-        java.util.Map<String, byte[]> frames = UdsCodec.reassemble(text, 3);
+        java.util.Map<String, byte[]> frames = UdsCodec.reassemble(text, idLen);
         byte[] payload = frames.get(responseId);
         if (payload == null) {
             throw new SilentException("no reply to batched read");
@@ -632,7 +775,7 @@ final class ElmClient {
     boolean keepAlive() {
         try {
             String text = raw("3E00", 1000);
-            byte[] p = UdsCodec.reassemble(text, 3).get(responseId);
+            byte[] p = UdsCodec.reassemble(text, idLen).get(responseId);
             // A lapsed session still answers 3E00 - the default session supports
             // it - so this is not a session-lapse detector. It catches the ECU
             // going quiet or refusing, which is the case that leaves the session

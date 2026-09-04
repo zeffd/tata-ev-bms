@@ -431,7 +431,8 @@ public final class SettingsActivity extends Activity {
             }
             id = bmsId.getText().toString().trim();
             if (!isValidRequestId(id)) {
-                rejected.add("Address must be 3 hex digits up to 7F7 (e.g. 785) or blank");
+                rejected.add("Address must be 3 hex digits up to 7F7 (e.g. 785), "
+                        + "8 hex digits for a 29-bit address, or blank");
             }
         }
 
@@ -465,6 +466,14 @@ public final class SettingsActivity extends Activity {
             boolean alreadyUserEntered = prefs.bmsRequestIdIsUserEntered();
             boolean changed = !fId.equalsIgnoreCase(prefs.bmsRequestId());
             prefs.setBmsRequestId(fId, !fId.isEmpty() && (changed || alreadyUserEntered));
+            if (changed) {
+                // The saved protocol belongs to the OLD address. Keeping it would
+                // open a newly typed 3-digit address on the 250 kbaud or 29-bit
+                // wire the previous one answered on, so it fails twice before the
+                // ladder recovers. Let the shape of the new id decide, the way
+                // MainActivity's trouble card does.
+                prefs.setBmsProtocol(fId.length() == 8 ? "ATTP7" : "");
+            }
             prefs.setAdapterName(adapterName.getText().toString());
         });
 
@@ -564,7 +573,7 @@ public final class SettingsActivity extends Activity {
     /** Blank (auto-detect) or a request id whose reply still fits an 11-bit CAN id. */
     private static boolean isValidRequestId(String id) {
         if (id == null || id.isEmpty()) return true;
-        return CommandGuard.isRequestId(id);
+        return CommandGuard.isRequestId(id) || CommandGuard.isExtendedRequestId(id);
     }
 
     private Integer parsed(EditText e) {

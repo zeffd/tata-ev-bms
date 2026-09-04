@@ -301,6 +301,11 @@ final class DidScanner {
      * self-consistent - 346.3 V over 104 cells of 3.328 V, or 332.8 V over 96
      * cells of 3.463 V. So rather than guess, we enumerate the physically
      * coherent readings and let a human pick the one that matches their car.
+     *
+     * Cells come in two units. The Gotion controller serves millivolts; the
+     * TacoGotion one, and the Tiago's VECU mirror of it, serve 10 mV counts
+     * (325 = 3.25 V). Either way a cell must land in 2.0-4.5 V - the gate that
+     * keeps a constant 5000 placeholder from being offered as a cell.
      */
     static final class VoltageHypothesis {
         final String packDid;
@@ -311,10 +316,30 @@ final class DidScanner {
         final double cellMinVolts;
         final double series;
         final double disagreement;   // lower is more self-consistent
+        /** 1 or 10: millivolts per count of the cell DIDs. */
+        final int cellUnitMv;
+        /** The pack DID changed between the two samples - a live pack, not a constant. */
+        final boolean packMoved;
+        /**
+         * The two cell DIDs sit within two codes of each other.
+         *
+         * Every controller this app has seen lays the pair out that way -
+         * 3415/3417 on the Gotion, 3477/3478 on the Tiago's mirror, 3017/3018
+         * on the $30xx family - because they are neighbouring signals in one
+         * catalog block. A coincidental pairing with an unrelated DID (a SOC in
+         * tenths reading 330 next to cells reading 331 and 330) is not adjacent,
+         * so this is what ranks the real pair above readings that are MORE
+         * self-consistent than the truth.
+         *
+         * Computed once here: {@link #BY_QUALITY} runs inside an O(n^3) search,
+         * so parsing hex in the comparator would cost the whole sweep.
+         */
+        final boolean cellsAdjacent;
 
         VoltageHypothesis(String packDid, String cellMaxDid, String cellMinDid,
                           double packVolts, double cellMaxVolts, double cellMinVolts,
-                          double series, double disagreement) {
+                          double series, double disagreement, int cellUnitMv, boolean packMoved) {
+            this.cellsAdjacent = adjacent(cellMaxDid, cellMinDid);
             this.packDid = packDid;
             this.cellMaxDid = cellMaxDid;
             this.cellMinDid = cellMinDid;
@@ -323,13 +348,25 @@ final class DidScanner {
             this.cellMinVolts = cellMinVolts;
             this.series = series;
             this.disagreement = disagreement;
+            this.cellUnitMv = cellUnitMv;
+            this.packMoved = packMoved;
+        }
+
+        /** Two DIDs within two codes of each other; false if either is not hex. */
+        private static boolean adjacent(String a, String b) {
+            try {
+                return Math.abs(Integer.parseInt(a, 16) - Integer.parseInt(b, 16)) <= 2;
+            } catch (NumberFormatException e) {
+                return false;
+            }
         }
 
         String describe() {
             return String.format(Locale.ROOT,
-                    "pack %.1f V = %.0f x %.3f V  (pack %s, max %s, min %s)",
+                    "pack %.1f V = %.0f x %.3f V  (pack %s, max %s, min %s)%s",
                     packVolts, series, (cellMaxVolts + cellMinVolts) / 2,
-                    packDid, cellMaxDid, cellMinDid);
+                    packDid, cellMaxDid, cellMinDid,
+                    cellUnitMv == 10 ? "  cells in 10 mV" : "");
         }
     }
 
@@ -341,9 +378,23 @@ final class DidScanner {
      * count both times. Ranked by how closely those two counts agree, then by how
      * near the count is to a whole number of cells.
      */
-    /** Best-first ordering: closest agreement, then nearest a whole cell count. */
+    /**
+     * Best-first: a pack DID that MOVED between samples first (a constant is a
+     * rail or a rating, not a pack), then a pair of ADJACENT cell DIDs, then
+     * closest agreement, then nearest a whole cell count.
+     *
+     * Adjacency outranks agreement deliberately. A coincidental pairing can be
+     * MORE self-consistent than the truth - on a TacoGotion pack whose SOC in
+     * tenths reads 330 while its cells read 331 and 330, treating the SOC as a
+     * cell agrees exactly while the real pair disagrees by 0.3 groups - and the
+     * first hypothesis is the one the screen offers first and the one the SOC
+     * exclusion trusts. Layout is the stronger evidence: cells come from one
+     * catalog block, an SOC does not.
+     */
     private static final java.util.Comparator<VoltageHypothesis> BY_QUALITY =
             (x, y) -> {
+                if (x.packMoved != y.packMoved) return x.packMoved ? -1 : 1;
+                if (x.cellsAdjacent != y.cellsAdjacent) return x.cellsAdjacent ? -1 : 1;
                 int c = Double.compare(x.disagreement, y.disagreement);
                 if (c != 0) return c;
                 double dx = Math.abs(x.series - Math.round(x.series));
@@ -399,52 +450,47 @@ final class DidScanner {
         return voltageHypotheses(hits, new int[1]);
     }
 
+    /** Pack candidates: two bytes, 150-900 V at 0.1 V per count. */
+    private static boolean packBand(Hit h) {
+        return h.length == 2 && h.first() >= 1500 && h.first() <= 9000;
+    }
+
+    /** Cells in 1 mV: 2.000-4.500 V, the plausibility window for any Li-ion cell. */
+    private static boolean cellBand1(Hit h) {
+        return h.length == 2 && h.first() >= 2000 && h.first() <= 4500;
+    }
+
+    /** Cells in 10 mV: the same window, 200-450 counts. */
+    private static boolean cellBand10(Hit h) {
+        return h.length == 2 && h.first() >= 200 && h.first() <= 450;
+    }
+
     private static List<VoltageHypothesis> voltageHypotheses(List<Hit> hits,
                                                              int[] droppedOut) {
         List<VoltageHypothesis> out = new ArrayList<>();
         if (hits == null) return out;
 
-        List<Hit> band = new ArrayList<>();
+        List<Hit> packs = new ArrayList<>(), cells1 = new ArrayList<>(), cells10 = new ArrayList<>();
+        java.util.Set<String> considered = new java.util.HashSet<>();
         for (Hit h : hits) {
-            int v = h.first();
-            if (h.length == 2 && v >= 2000 && v <= 5000) band.add(h);
+            if (packBand(h)) packs.add(h);
+            if (cellBand1(h)) cells1.add(h);
+            if (cellBand10(h)) cells10.add(h);
+            if (packBand(h) || cellBand1(h) || cellBand10(h)) considered.add(h.did);
         }
-        if (band.size() > MAX_BAND) {
-            droppedOut[0] = band.size() - MAX_BAND;
-            band = new ArrayList<>(band.subList(0, MAX_BAND));
-        }
-
-        for (Hit p : band) {
-            for (Hit a : band) {
-                if (a == p) continue;
-                for (Hit b : band) {
-                    if (b == p || b == a || a.first() < b.first()) continue;
-                    double s1 = p.first() * 100.0 / a.first();
-                    double s2 = p.first() * 100.0 / b.first();
-                    if (s1 < 24 || s1 > 220 || s2 < 24 || s2 > 220) continue;
-                    double disagree = Math.abs(s1 - s2);
-                    if (disagree > 2.0) continue;         // not the same pack
-                    double series = (s1 + s2) / 2.0;
-                    VoltageHypothesis h = new VoltageHypothesis(p.did, a.did, b.did,
-                            p.first() / 10.0, a.first() / 1000.0, b.first() / 1000.0,
-                            series, disagree);
-                    // Bounded insert, kept sorted. Collecting every match and
-                    // sorting afterwards retained 12.8 M objects (~1 GB) on a
-                    // band of 800 - an OOM before anything had been saved.
-                    if (out.size() >= MAX_KEPT
-                            && BY_QUALITY.compare(h, out.get(out.size() - 1)) >= 0) {
-                        continue;
-                    }
-                    int i = out.size();
-                    out.add(h);
-                    while (i > 0 && BY_QUALITY.compare(out.get(i), out.get(i - 1)) < 0) {
-                        Collections.swap(out, i, i - 1);
-                        i--;
-                    }
-                    if (out.size() > MAX_KEPT) out.remove(out.size() - 1);
-                }
-            }
-        }
+        cap(packs);
+        cap(cells1);
+        cap(cells10);
+        // The note counts RESPONDERS left out, and the bands overlap - the pack
+        // band contains every 1 mV cell candidate. Summing each band's trim would
+        // report one responder twice, so count the distinct ones no band kept.
+        java.util.Set<String> kept = new java.util.HashSet<>();
+        for (Hit h : packs) kept.add(h.did);
+        for (Hit h : cells1) kept.add(h.did);
+        for (Hit h : cells10) kept.add(h.did);
+        droppedOut[0] = considered.size() - kept.size();
+        search(out, packs, cells1, 1);
+        search(out, packs, cells10, 10);
 
         // Keep one hypothesis per (cellMax, cellMin) pairing: duplicate pack sense
         // points otherwise flood the list with the same physical reading.
@@ -461,6 +507,49 @@ final class DidScanner {
             if (unique.size() >= 6) break;
         }
         return unique;
+    }
+
+    /** Trim a band to MAX_BAND in place; the search is O(n^3) in the band size. */
+    private static void cap(List<Hit> band) {
+        while (band.size() > MAX_BAND) band.remove(band.size() - 1);
+    }
+
+    /**
+     * Enumerate self-consistent (pack, cellMax, cellMin) readings for one cell
+     * unit. A reading is coherent when the pack divided by either cell gives the
+     * SAME plausible series count. Bounded insert, kept sorted: collecting every
+     * match and sorting afterwards once retained ~1 GB of objects on a wide sweep.
+     */
+    private static void search(List<VoltageHypothesis> out, List<Hit> packs, List<Hit> cells,
+                               int unitMv) {
+        for (Hit p : packs) {
+            for (Hit a : cells) {
+                if (a == p) continue;
+                for (Hit b : cells) {
+                    if (b == p || b == a || a.first() < b.first()) continue;
+                    double s1 = p.first() * 100.0 / (a.first() * unitMv);
+                    double s2 = p.first() * 100.0 / (b.first() * unitMv);
+                    if (s1 < 24 || s1 > 220 || s2 < 24 || s2 > 220) continue;
+                    double disagree = Math.abs(s1 - s2);
+                    if (disagree > 2.0) continue;         // not the same pack
+                    double series = (s1 + s2) / 2.0;
+                    VoltageHypothesis h = new VoltageHypothesis(p.did, a.did, b.did,
+                            p.first() / 10.0, a.first() * unitMv / 1000.0,
+                            b.first() * unitMv / 1000.0, series, disagree, unitMv, p.changed());
+                    if (out.size() >= MAX_KEPT
+                            && BY_QUALITY.compare(h, out.get(out.size() - 1)) >= 0) {
+                        continue;
+                    }
+                    int i = out.size();
+                    out.add(h);
+                    while (i > 0 && BY_QUALITY.compare(out.get(i), out.get(i - 1)) < 0) {
+                        Collections.swap(out, i, i - 1);
+                        i--;
+                    }
+                    if (out.size() > MAX_KEPT) out.remove(out.size() - 1);
+                }
+            }
+        }
     }
 
     /**
@@ -481,18 +570,63 @@ final class DidScanner {
         return suggest(hits, hits == null ? null : voltageHypotheses(hits));
     }
 
+    /**
+     * DIDs the voltage search accounted for, which the SOC/SOH pick must skip.
+     *
+     * A 10 mV cell reads 200..450 counts, which is INSIDE the 0..1000 SOC
+     * window, and on a car that is not parked it moves between samples - so the
+     * "first 2-byte value that moved" rule in {@link #suggest} would name cell
+     * 3477 as "SOC 32.5 %". Worse, having a soc_pct suggestion makes
+     * ScanActivity.showSocChoice return early, so the owner is handed a wrong
+     * SOC with no correction path on the screen.
+     *
+     * Only the 10 mV cells can actually collide: the pack band starts at 1500
+     * counts and the 1 mV cell band at 2000, both above the 1000 the SOC pick
+     * admits. The top reading's pack and cells are added anyway, so that
+     * widening either band later cannot quietly reintroduce the bug - they are
+     * belt and braces, not the load-bearing part.
+     *
+     * The 10 mV cells are taken only from readings whose two cell DIDs are
+     * ADJACENT. A genuine tenths-of-a-percent SOC also reads 200..450, so the
+     * search enumerates pairings that use it as a cell; excluding those too
+     * would drop the real SOC. Adjacency is what tells them apart - see
+     * {@link VoltageHypothesis#cellsAdjacent}.
+     *
+     * Whatever this removes is offered back on the screen by
+     * {@link #socCandidatesTenths}, so no exclusion can leave an owner without
+     * a way to map SOC.
+     */
+    private static java.util.Set<String> voltageDids(List<VoltageHypothesis> vh) {
+        java.util.Set<String> out = new java.util.HashSet<>();
+        if (vh == null || vh.isEmpty()) return out;
+        VoltageHypothesis top = vh.get(0);
+        out.add(top.packDid);
+        out.add(top.cellMaxDid);
+        out.add(top.cellMinDid);
+        for (VoltageHypothesis h : vh) {
+            if (h.cellUnitMv == 10 && h.cellsAdjacent) {
+                out.add(h.cellMaxDid);
+                out.add(h.cellMinDid);
+            }
+        }
+        return out;
+    }
+
     /** As {@link #suggest(List)}, reusing hypotheses already computed. */
     static Map<String, String> suggest(List<Hit> hits, List<VoltageHypothesis> vh) {
         Map<String, String> out = new LinkedHashMap<>();
         if (hits == null || hits.isEmpty()) return out;
+
+        java.util.Set<String> voltageDids = voltageDids(vh);
 
         List<Hit> pct = new ArrayList<>();
         List<Hit> bytes = new ArrayList<>();
         for (Hit h : hits) {
             int v = h.first();
             if (v < 0) continue;
-            if (h.length == 2 && v <= 1000) pct.add(h);
-            else if (h.length == 1) bytes.add(h);
+            if (h.length == 2 && v <= 1000) {
+                if (!voltageDids.contains(h.did)) pct.add(h);
+            } else if (h.length == 1) bytes.add(h);
         }
 
         // SOC moves; SOH sits still and reads high. Both are u16 tenths of a percent.
@@ -584,10 +718,78 @@ final class DidScanner {
         return out;
     }
 
+    /**
+     * DIDs that could be a state of charge in WHOLE percent, for a human to
+     * match against the dash. suggest() only finds a tenths-of-a-percent SOC
+     * that moved between samples; a parked car's whole-percent SOC does neither,
+     * so it is offered rather than guessed. Values 0..100, one or two bytes,
+     * not a suggested role, not a cell or pack candidate; the ones that moved
+     * first; at most twelve so the screen stays a list and not a sweep.
+     */
+    static List<Hit> socCandidates(List<Hit> hits, Map<String, String> suggestion) {
+        List<Hit> out = new ArrayList<>();
+        if (hits == null) return out;
+        java.util.Set<String> taken = new java.util.HashSet<>();
+        if (suggestion != null) taken.addAll(suggestion.values());
+        for (Hit h : hits) {
+            int v = h.first();
+            if (v < 0 || v > 100 || h.length > 2) continue;
+            if (taken.contains(h.did) || cellBand10(h) || packBand(h)) continue;
+            out.add(h);
+        }
+        Collections.sort(out, (x, y) -> {
+            if (x.changed() != y.changed()) return x.changed() ? -1 : 1;
+            return x.did.compareTo(y.did);
+        });
+        return out.size() > 12 ? new ArrayList<>(out.subList(0, 12)) : out;
+    }
 
+    /**
+     * DIDs that could be a state of charge in TENTHS of a percent but were set
+     * aside as pack or cell voltages, for a human to match against the dash.
+     *
+     * The safety net under {@link #voltageDids}. Pack volts, 10 mV cells and a
+     * tenths SOC are all 2-byte counts in overlapping ranges, so any rule that
+     * keeps a moving cell from being named "SOC 32.5 %" can also catch a real
+     * SOC that happens to read like a cell - roughly when SOC % equals ten times
+     * the cell voltage, e.g. 33.0 % on cells at 3.30 V. When that happens the
+     * suggestion is empty and the whole-percent list in {@link #socCandidates}
+     * cannot help either, because it only admits values up to 100.
+     *
+     * So whatever the exclusion removed is offered here instead: 2-byte,
+     * 101..1000 (below 101 is the whole-percent list's business), and MOVING,
+     * because a state of charge that never changes between two samples is a
+     * constant, not a reading. Applied with a 0.1 scale rather than 1.
+     *
+     * @param vh         the same hypotheses the suggestion was built from
+     * @param suggestion roles already mapped, which are not offered again
+     */
+    static List<Hit> socCandidatesTenths(List<Hit> hits, List<VoltageHypothesis> vh,
+                                         Map<String, String> suggestion) {
+        List<Hit> out = new ArrayList<>();
+        if (hits == null) return out;
+        java.util.Set<String> excluded = voltageDids(vh);
+        java.util.Set<String> taken = new java.util.HashSet<>();
+        if (suggestion != null) taken.addAll(suggestion.values());
+        for (Hit h : hits) {
+            int v = h.first();
+            if (h.length != 2 || v <= 100 || v > 1000) continue;
+            if (!excluded.contains(h.did) || taken.contains(h.did)) continue;
+            if (!h.changed()) continue;
+            out.add(h);
+        }
+        Collections.sort(out, (x, y) -> x.did.compareTo(y.did));
+        return out.size() > 12 ? new ArrayList<>(out.subList(0, 12)) : out;
+    }
 
-    /** Write a shareable report of the scan, including the suggested mapping. */
-    static File writeReport(File dir, String bmsId, List<Hit> hits,
+    /**
+     * Write a shareable report of the scan, including the suggested mapping.
+     *
+     * @param preamble lines the caller knows and this class cannot - the range
+     *                 swept, when, which app version, what the adapter said -
+     *                 written right under the title. "" for none.
+     */
+    static File writeReport(File dir, String bmsId, String preamble, List<Hit> hits,
                             Map<String, String> suggestion,
                             Analysis analysis, String warning) throws IOException {
         //noinspection ResultOfMethodCallIgnored
@@ -597,6 +799,9 @@ final class DidScanner {
         try (FileWriter w = new FileWriter(out)) {
             w.write("Tata EV BMS - DID scan\n");
             w.write("BMS request id: " + bmsId + "\n");
+            if (preamble != null && !preamble.isEmpty()) {
+                w.write(preamble.endsWith("\n") ? preamble : preamble + "\n");
+            }
             w.write("Responders: " + hits.size() + "\n");
             // The report is the artifact people map from on a desktop, so a
             // truncated sweep must say so HERE, not only on the phone screen -
@@ -622,6 +827,13 @@ final class DidScanner {
             } else {
                 for (int i = 0; i < vh.size(); i++) {
                     w.write("  [" + (i + 1) + "] " + vh.get(i).describe() + "\n");
+                }
+            }
+            List<Hit> soc = socCandidates(hits, suggestion);
+            if (!soc.isEmpty()) {
+                w.write("\nWhole-percent SOC candidates - match one against the dash:\n");
+                for (Hit h : soc) {
+                    w.write("  " + h.did + " = " + h.first() + (h.changed() ? "  (moved)" : "") + "\n");
                 }
             }
             w.write("\nSuggested mapping for the unambiguous roles:\n");

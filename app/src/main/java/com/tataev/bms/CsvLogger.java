@@ -67,10 +67,10 @@ final class CsvLogger {
         //noinspection ResultOfMethodCallIgnored
         dir.mkdirs();
         prefs = new Prefs(ctx);
-        appVersion = versionOf(ctx);
+        appVersion = appVersion(ctx);
     }
 
-    private static String versionOf(Context ctx) {
+    static String appVersion(Context ctx) {
         try {
             String v = ctx.getPackageManager()
                     .getPackageInfo(ctx.getPackageName(), 0).versionName;

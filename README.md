@@ -1,6 +1,6 @@
 # Tata EV BMS
 
-A deliberately small Android app (**~100 KB APK, zero dependencies**) that reads
+A deliberately small Android app (**~125 KB APK, zero dependencies**) that reads
 live battery data from Tata electric vehicles over a cheap Bluetooth ELM327
 adapter — and helps find a weak cell group before it strands you.
 
@@ -27,7 +27,8 @@ range (Nexon, Tiago, Punch, Curvv) because nothing model-specific is hardcoded.
   the alarm stream, so Do Not Disturb doesn't eat them.
 - **CSV logging** in a foreground service (screen off is fine). Every row also
   records the raw hex of every DID, so scalings can be re-derived later without
-  re-driving.
+  re-driving, plus a `layout` marker so a replay knows how to read the file
+  regardless of what version wrote it.
 - **Multi-car** — profiles keyed by VIN, switched automatically on connect.
 
 ## Read-only by construction
@@ -47,7 +48,8 @@ SecurityAccess (`0x27`) are refused before they reach the socket — even by typ
 ## Requirements
 
 - A Tata EV (developed on a Nexon EV Max; see below for other models)
-- A Bluetooth **ELM327** OBD adapter (classic Bluetooth / SPP)
+- A Bluetooth **ELM327** OBD adapter (classic Bluetooth / SPP). WiFi and
+  Bluetooth-LE-only adapters are not supported yet — see *Adapters*.
 - Android 7.0+ (minSdk 24)
 
 ## Install
@@ -65,6 +67,34 @@ Grab the APK from the [Releases](../../releases) page, or build it yourself
 The APK is debug-signed on purpose (it is a sideloaded diagnostic tool);
 installing a build signed by a different machine requires uninstalling first,
 which deletes on-device logs — share them off the phone before switching.
+
+## Adapters
+
+Most "does not work" reports so far have been the adapter, not the car. Every
+ELM327 sold under $10 is a clone, and some clones refuse commands the genuine
+chip accepts. The app copes with the common ones — a missing receive filter
+(replies are filtered in software) and missing flow control (long replies are
+read as far as they arrive) — and records what the adapter refused at the top
+of the **detection report**, so a failure can be diagnosed from one shared file.
+
+If the dashboard stops at *Could not find a battery controller*, tap **Share
+detection report** on that card and send the file. It names the adapter, the
+commands it rejected, every protocol tried and every address that answered. It
+contains no VIN.
+
+What the app tries, in order, before giving up: the Nexon's 0x7xx addresses on
+11-bit CAN at 500 kbaud, a broadcast to the whole bus, then 29-bit CAN at the
+addresses Tata's own service tool uses for its battery controllers. The
+250 kbaud variants of both come only on the retry, and only after a sweep in
+which the car said nothing at all — a car that is not switched on yet looks
+exactly like a 250 kbaud one, and probing 250 kbaud on a live 500 kbaud bus
+puts error frames on it. A car whose battery controller answers on 29-bit is
+remembered and reconnects directly next time.
+
+Two kinds of battery controller are understood without any mapping: the
+Gotion controller (Nexon EV and EV Max) and the TacoGotion / CESL / Kratos
+family, which serves the same readings at different codes and scales. A model
+with something else answers in unknown codes, and **Scan vehicle** maps it.
 
 ## On a Tata model with a different DID map
 
@@ -98,7 +128,7 @@ JDK 17; the Gradle wrapper fetches the rest (Android SDK 35 via `ANDROID_HOME`).
 Run the self-test — pure `javac`/`java`, no JUnit, no network, no device:
 
 ```bash
-./run-selftest.sh   # 429 assertions against real captured frames
+./run-selftest.sh   # 694 assertions against real captured frames
 ```
 
 Pushing a `v*` tag builds the APK in CI and attaches it to a GitHub release.
@@ -113,7 +143,7 @@ selftest/                           test doubles + SelfTest.java
 
 The UI is built programmatically (no XML layouts, no AndroidX, no Compose) —
 the dashboard is generated from the field map, and that is how the APK stays
-around 100 KB.
+around 125 KB.
 
 ## License
 

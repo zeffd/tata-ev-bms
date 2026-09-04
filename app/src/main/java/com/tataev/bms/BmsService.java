@@ -462,6 +462,17 @@ public final class BmsService extends Service {
                     }
                     pollOnce(client);
                     holdSession(client);
+                    // The floor is the CADENCE, not a gap tacked onto however long
+                    // the round-trips took; a cycle that took longer waits nothing.
+                    //
+                    // INSIDE the guard: idle() calls holdSession() between sleep
+                    // chunks, so a RuntimeException from the keep-alive path used
+                    // to escape the loop into finally and end the worker - the
+                    // zombie service this catch exists to prevent, reached by the
+                    // one call that was outside it. An error now skips the rest of
+                    // this cycle and reconnects, which is what the message says.
+                    long spent = SystemClock.elapsedRealtime() - started;
+                    idle(client, MIN_CYCLE_MS - spent);
                 } catch (RuntimeException e) {
                     // A malformed frame must never kill this thread: the service
                     // would stay alive as a zombie, frozen on the last reading.
@@ -469,10 +480,6 @@ public final class BmsService extends Service {
                     client.close();
                     fail("Recovered from error - reconnecting");
                 }
-                // The floor is the CADENCE, not a gap tacked onto however long
-                // the round-trips took; a cycle that took longer waits nothing.
-                long spent = SystemClock.elapsedRealtime() - started;
-                idle(client, MIN_CYCLE_MS - spent);
             }
         } finally {
             client.close();
@@ -572,8 +579,14 @@ public final class BmsService extends Service {
 
             String configured = prefs.bmsRequestId();
             String bmsAddress = configured;
+            ElmClient.BmsInfo found = null;
             boolean pinned = configured != null && !configured.isEmpty();
             if (pinned) {
+                // Open the saved address on the protocol it was found on. A 29-bit
+                // address saved before protocols were persisted still opens on
+                // ATTP7 by its shape, and one saved under the older persisting
+                // name (ATSP7/8/9) resolves to the same rung's ATTP form.
+                client.useProtocol(ProtocolLadder.atspForId(configured, prefs.bmsProtocol()));
                 client.initAndTargetBms(configured);
                 // ATSH/ATCRA are adapter-local and always answer OK, so a saved
                 // address must be confirmed against a real read or a stale one
@@ -616,52 +629,105 @@ public final class BmsService extends Service {
                 }
             }
             if (!pinned) {
-                setState(State.DETECTING, "Locating BMS...");
-                publish(null);
-                ElmClient.BmsInfo found = client.detectBms(
-                        BmsFields.BMS_CANDIDATES,
-                        msg -> {
-                            setState(State.DETECTING, msg);
-                            publish(null);
-                        });
-                if (found == null) {
-                    // The candidate list failed - ask the WHOLE bus who is there
-                    // before giving up. A model whose BMS lives at an address
-                    // this app has never seen (the first Tiago EV field report)
-                    // is found this way instead of dead-ending at a typed-address
-                    // card the owner cannot fill in.
-                    setState(State.DETECTING, "Asking every ECU on the bus...");
+                // The ladder. Today's behaviour is the first rung and runs
+                // unchanged; every later rung only fires after the one before it
+                // heard nothing battery-shaped. The 29-bit rungs try the
+                // addresses Tata's own catalogs use before asking the bus.
+                String heardElsewhere = "";
+                // Across ALL rungs: sweepCandidates() resets lastDetectAnswered on
+                // every call, so the last rung alone would call a Tiago whose VECU
+                // answered on rung 1 "a silent car".
+                int answeredTotal = 0;
+                boolean heardAnything = false;
+                boolean first = true;
+                ElmClient.ProgressSink sink = msg -> {
+                    // The 10-minute lease is otherwise renewed only once
+                    // establish() returns, and a four-rung ladder with a sweep
+                    // budget per rung plus broadcast discovery can approach it.
+                    // Every probed address ticks this, so the phone cannot doze
+                    // mid-detection and leave a half-open link behind.
+                    refreshWakeLock();
+                    setState(State.DETECTING, msg);
                     publish(null);
-                    java.util.List<String> extra = client.discoverEcus();
-                    extra.removeAll(BmsFields.BMS_CANDIDATES);
-                    if (!extra.isEmpty()) {
-                        found = client.sweepCandidates(extra, msg -> {
-                            setState(State.DETECTING, msg);
-                            publish(null);
-                        });
+                };
+                for (ProtocolLadder.Rung rung : ProtocolLadder.rungs()) {
+                    if (destroyed || !running) return false;
+                    // A 250 kbaud probe on a live 500 kbaud bus puts error frames
+                    // on the diagnostic bus until the adapter goes bus-off, and
+                    // ECUs may log it. Those rungs are for a bus that said NOTHING.
+                    //
+                    // "Nothing" on the FIRST sweep is most often a car that is
+                    // simply not awake yet - the owner opens the app before
+                    // switching on, which auto-connect makes routine - and a
+                    // sleeping 500 kbaud Nexon looks identical to a 250 kbaud
+                    // car. So the first attempt never goes to 250 kbaud; the
+                    // retry does. silentSweeps is 0 on the first pass and 1 on
+                    // the retry (it is incremented after this loop), which is
+                    // exactly the distinction needed.
+                    boolean is250k = "ATTP8".equals(rung.atsp) || "ATTP9".equals(rung.atsp);
+                    if (is250k && (answeredTotal > 0 || heardAnything || silentSweeps == 0)) {
+                        client.noteInLog("--- " + rung.name + ": skipped, "
+                                + (silentSweeps == 0 && answeredTotal == 0 && !heardAnything
+                                        ? "deferred to the retry - a car that is not awake yet "
+                                          + "looks the same as a 250 kbaud one"
+                                        : "the bus already answered at 500 kbaud")
+                                + " ---");
+                        continue;
                     }
-                    discoveredEcus = (found != null || extra.isEmpty())
-                            ? "" : String.join(", ", extra);
+                    setState(State.DETECTING, "Locating BMS (" + rung.name + ")...");
+                    publish(null);
+                    if (first) {
+                        client.useProtocol(rung.atsp);
+                        found = client.detectBms(rung.candidates, sink);   // runs initAdapter
+                        first = false;
+                    } else {
+                        client.noteInLog("--- " + rung.name + " ---");
+                        client.switchProtocol(rung.atsp);
+                        // A stripped clone can know ATSP6 and not ATTP7. Sweeping
+                        // anyway probes 29-bit addresses while the link is still
+                        // 11-bit 500 kbaud: it cannot find anything, and an empty
+                        // sweep in the transcript reads as "the car is silent"
+                        // rather than "the adapter would not go there".
+                        if (!client.caps().supports(rung.atsp)) {
+                            client.noteInLog("--- " + rung.name + ": skipped, adapter refused "
+                                    + rung.atsp + " ---");
+                            continue;
+                        }
+                        found = client.sweepCandidates(rung.candidates, sink);
+                    }
+                    answeredTotal += client.lastDetectAnswered();
+                    if (found != null) break;
+                    // Ask the WHOLE bus who is there at this rung before moving
+                    // on. A model whose BMS lives at an address this app has never
+                    // seen is found this way instead of dead-ending at a typed-
+                    // address card the owner cannot fill in.
+                    setState(State.DETECTING, "Asking every ECU on the bus (" + rung.name + ")...");
+                    publish(null);
+                    java.util.List<String> extra = client.discoverEcus(rung.functional);
+                    if (!extra.isEmpty()) heardAnything = true;
+                    extra.removeAll(rung.candidates);
+                    if (!extra.isEmpty()) {
+                        found = client.sweepCandidates(extra, sink);
+                        answeredTotal += client.lastDetectAnswered();
+                        if (found != null) break;
+                        heardElsewhere = String.join(", ", extra) + " (" + rung.name + ")";
+                    }
                 }
+                discoveredEcus = found != null ? "" : heardElsewhere;
                 if (found == null) {
                     client.close();
-                    boolean carSilent = client.lastDetectAnswered() == 0;
+                    boolean carSilent = answeredTotal == 0 && !heardAnything;
                     if (carSilent && ++silentSweeps < 2) {
-                        // Nothing answered anywhere: an asleep or switched-off car
-                        // looks exactly like this. One more sweep before giving
-                        // up, with the reason the owner can act on.
+                        // Nothing answered anywhere on any rung: an asleep or
+                        // switched-off car looks exactly like this. One more try.
                         fail("No answer from the car at any address - is it switched on? Retrying");
                         return false;
                     }
                     silentSweeps = 0;
-                    // Deterministic on an awake car, so retrying only hides the
-                    // fix: stop, and let the dashboard turn this into an address
-                    // field - an owner of a model whose BMS neither names itself
-                    // nor serves the Nexon's data DIDs may know where it lives.
                     trouble = Trouble.NO_BMS;
-                    // Save what the car said, so the owner of an unrecognised
-                    // model can send the developer facts instead of guesses.
-                    detectReportPath = saveDetectReport(client.detectionLog());
+                    detectReportPath = saveDetectReport(
+                            client.caps().report() + "App: " + CsvLogger.appVersion(this) + "\n",
+                            client.detectionLog());
                     fatal(carSilent
                             ? "No answer from the car at any address this app knows"
                             : "Could not find a battery controller on this vehicle");
@@ -669,22 +735,55 @@ public final class BmsService extends Service {
                 }
                 silentSweeps = 0;
                 // detectBms already ran initAdapter(); repeating it here would be a
-                // second ATZ hardware reset that discards ATH1/ATSP6/ATCAF1.
+                // second ATZ hardware reset that discards the protocol just chosen.
                 client.targetAndOpenSession(found.requestId);
-                // NOT persisted here: identifyVehicle below may switch profiles,
-                // and saving now would pin this car's address on the profile of
-                // whatever car was active before. identifyVehicle stores it on
-                // whichever profile ends up active - still only after it worked.
+                // NOT persisted here: identifyVehicle below may switch profiles.
                 bmsAddress = found.requestId;
                 if (!destroyed) {
-                    bmsInfoText = "BMS " + found.requestId + "/" + found.responseId
+                    String proto = "ATSP6".equals(found.protocol) ? ""
+                            : "  " + ProtocolLadder.forProtocol(found.protocol).name;
+                    bmsInfoText = "BMS " + found.requestId + "/" + found.responseId + proto
                             + "  " + found.systemName
                             + (found.supplier == null || found.supplier.isEmpty()
                             ? "" : " (" + found.supplier + ")");
                 }
             }
 
-            identifyVehicle(client, bmsAddress);
+            final boolean resolved = identifyVehicle(client, bmsAddress);
+
+            // A $30xx-dialect controller: load its catalog's DIDs and scales as a
+            // preset - once, and only into a profile this connect actually
+            // identified, with nothing mapped by hand on it. ProfileMatch
+            // .mayApplyPreset holds that rule (and says why); the whole gate runs
+            // inside commitIfActiveProfile so a profile switch on another thread
+            // cannot redirect fourteen DID writes into another car's record.
+            if (found != null && "30xx".equals(found.dialect)) {
+                final Presets.Preset p =
+                        Presets.identify30xx(client.lastSocLen(), client.lastIdxLen());
+                if (p != null) {
+                    final boolean[] applied = { false };
+                    // The return value is the THIRD reason a preset can be
+                    // skipped: the active profile changed between reading it
+                    // here and taking the monitor, so nothing was written. The
+                    // behaviour is right either way (fail-safe: no write), but a
+                    // log line blaming "already mapped" for a profile switch
+                    // sends the next support case looking in the wrong place.
+                    boolean sameProfile = prefs.commitIfActiveProfile(prefs.activeProfile(), () -> {
+                        if (!ProfileMatch.mayApplyPreset(resolved, prefs.hasAnyOverride())) return;
+                        applyPreset(p);
+                        applied[0] = true;
+                    });
+                    if (applied[0]) {
+                        Log.i(TAG, "applied battery map preset " + p.name);
+                        if (!destroyed) bmsInfoText = bmsInfoText + "  ·  " + p.name;
+                    } else {
+                        Log.i(TAG, "preset " + p.name + " NOT applied: "
+                                + (!sameProfile ? "profile switched during identification"
+                                        : resolved ? "profile already mapped"
+                                        : "profile unconfirmed"));
+                    }
+                }
+            }
 
             // A new link may be a different vehicle or adapter, so give the
             // batching optimisation another chance rather than staying latched off.
@@ -754,8 +853,13 @@ public final class BmsService extends Service {
      * no VIN, a fingerprint of address + supplier stands in; when neither is
      * readable the active profile simply stays, because churning profiles on a
      * bad link would scatter one car's calibration across several records.
+     *
+     * @return whether the active profile is now RESOLVED to the connected car.
+     *         False only on the unresolved path below - VIN-keyed profile, no
+     *         VIN read - where nothing was attached and the caller must not
+     *         write per-vehicle data either (see ProfileMatch.mayApplyPreset).
      */
-    private void identifyVehicle(ElmClient client, String bmsAddress) {
+    private boolean identifyVehicle(ElmClient client, String bmsAddress) {
         String vin = ProfileMatch.extractVin(client.readIdString(BmsFields.DID_VIN));
         boolean byVin = !vin.isEmpty();
         int active = prefs.activeProfile();
@@ -806,6 +910,7 @@ public final class BmsService extends Service {
         // unresolved path above: this may not be the profile's car at all.
         if (!unresolved && prefs.bmsRequestId().isEmpty()) {
             prefs.setBmsRequestId(bmsAddress);
+            prefs.setBmsProtocol(client.protocol());
         }
         // On the unresolved path the profile's name would assert an
         // identification that did not happen; label the session honestly.
@@ -813,6 +918,20 @@ public final class BmsService extends Service {
         if (!destroyed && !pn.isEmpty()) {
             bmsInfoText = bmsInfoText + "  ·  " + pn;
         }
+        return !unresolved;
+    }
+
+    /** Write a catalog preset into the active profile: DIDs, scales, current calibration. */
+    private void applyPreset(Presets.Preset p) {
+        for (Map.Entry<String, String> e : p.dids.entrySet()) {
+            prefs.setDidOverride(e.getKey(), e.getValue());
+        }
+        for (Map.Entry<String, String> e : p.scales.entrySet()) {
+            prefs.setScaleOverride(e.getKey(), e.getValue());
+        }
+        prefs.setCurrentScale(p.currentScale);
+        prefs.setCurrentZero(p.currentZero);
+        prefs.setPresetName(p.name);
     }
 
     /**
@@ -833,10 +952,11 @@ public final class BmsService extends Service {
     }
 
     /**
-     * The detection transcript, saved as a shareable file: address by address,
-     * who answered and what it called itself.
+     * The detection transcript, saved as a shareable file: what the adapter is
+     * and what it refused first, then address by address who answered and what
+     * it called itself.
      */
-    private String saveDetectReport(String log) {
+    private String saveDetectReport(String header, String log) {
         try {
             java.io.File dir = CsvLogger.logsDir(this);
             //noinspection ResultOfMethodCallIgnored
@@ -844,12 +964,16 @@ public final class BmsService extends Service {
             String stamp = new java.text.SimpleDateFormat("yyyyMMdd_HHmmss",
                     java.util.Locale.US).format(new java.util.Date());
             java.io.File f = new java.io.File(dir, "detect_" + stamp + ".txt");
-            java.io.FileWriter w = new java.io.FileWriter(f);
-            w.write("Tata EV BMS - detection report\n"
-                    + "No battery controller was identified. Below is every address "
-                    + "probed and what answered.\n\n");
-            w.write(log == null ? "" : log);
-            w.close();
+            // try-with-resources, as DidScanner.writeReport does: a write that
+            // throws must still close the handle.
+            try (java.io.FileWriter w = new java.io.FileWriter(f)) {
+                w.write("Tata EV BMS - detection report\n"
+                        + "No battery controller was identified. Below is every address "
+                        + "probed and what answered.\n\n");
+                w.write(header == null ? "" : header);
+                w.write("\n");
+                w.write(log == null ? "" : log);
+            }
             return f.getAbsolutePath();
         } catch (java.io.IOException e) {
             return null;
@@ -881,7 +1005,9 @@ public final class BmsService extends Service {
         for (BmsFields.Field f : BmsFields.ALL) {
             // A non-primary field exists only to be logged. Primary fields feed
             // the dashboard and are polled whether or not recording is on.
-            if (!(f.primary || wantExtras)) continue;
+            // Status-strip fields are shown, so they are polled whether or not
+            // recording is on - on slow cycles, like every non-map role.
+            if (!(f.primary || f.status || wantExtras)) continue;
             // The pack-map roles every cycle; everything else only on a slow one.
             if (slowCycle || PackMap.requiredKey(f.key)) wanted.add(f);
         }
@@ -895,10 +1021,13 @@ public final class BmsService extends Service {
         // ask for is the exact key we look the answer up under.
         final List<String> resolved = new ArrayList<>(wanted.size());
         final Map<String, Integer> widthByDid = new HashMap<>();
+        final Map<String, BmsFields.Scale> scales = new HashMap<>();
         for (BmsFields.Field f : wanted) {
             String did = BmsFields.effectiveDid(f, prefs).toUpperCase(Locale.ROOT);
             resolved.add(did);
-            widthByDid.put(did, BmsFields.width(f.kind));
+            BmsFields.Scale s = BmsFields.scaleOf(f, prefs);
+            if (s != null) scales.put(f.key, s);
+            widthByDid.put(did, BmsFields.width(f, prefs));
         }
         final UdsCodec.WidthLookup widths = did -> {
             Integer w = did == null ? null : widthByDid.get(did.toUpperCase(Locale.ROOT));
@@ -974,7 +1103,7 @@ public final class BmsService extends Service {
                     byte[] data = batch.get(dids.get(j));
                     if (data == null) continue;      // ECU omitted it: unsupported
                     r.raw.put(f.key, UdsCodec.toHex(data));
-                    Double v = BmsFields.decode(f, data, scale, zero);
+                    Double v = BmsFields.decode(f, data, scales.get(f.key), scale, zero);
                     if (v != null) r.values.put(f.key, v);
                 }
                 continue;
@@ -987,7 +1116,7 @@ public final class BmsService extends Service {
                     UdsCodec.Response resp = client.readDid(dids.get(j));
                     if (resp != null && resp.isData()) {
                         r.raw.put(f.key, UdsCodec.toHex(resp.data));
-                        Double v = BmsFields.decode(f, resp.data, scale, zero);
+                        Double v = BmsFields.decode(f, resp.data, scales.get(f.key), scale, zero);
                         if (v != null) r.values.put(f.key, v);
                     }
                 } catch (IOException e) {
