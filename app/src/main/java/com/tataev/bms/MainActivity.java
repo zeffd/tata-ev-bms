@@ -85,6 +85,8 @@ public final class MainActivity extends Activity {
     private BmsService.Trouble shownTrouble = BmsService.Trouble.NONE;
     private TextView deltaValue;
     private TextView deltaSub;
+    /** What the BMS is doing to the pack right now; amber while it derates. */
+    private TextView statusStrip;
     private View deltaBar;
     private TextView logState;
     private TextView logDetail;
@@ -210,6 +212,21 @@ public final class MainActivity extends Activity {
         LinearLayout content = new LinearLayout(this);
         content.setOrientation(LinearLayout.VERTICAL);
         content.addView(buildDeltaBar(side));
+
+        // Insulation, the limits the BMS is imposing, derating, balancing and
+        // SOC calibration state - one quiet line. A derating pack is the one
+        // moment this line matters, so it turns amber then.
+        statusStrip = new TextView(this);
+        statusStrip.setTextSize(11);
+        statusStrip.setTextColor(MUTED);
+        statusStrip.setLineSpacing(0, 1.2f);
+        statusStrip.setPadding(dp(4), 0, dp(4), 0);
+        statusStrip.setVisibility(View.GONE);
+        LinearLayout.LayoutParams stripLp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        stripLp.setMargins(side, 0, side, dp(8));
+        content.addView(statusStrip, stripLp);
 
         alertView = new TextView(this);
         alertView.setTextSize(13);
@@ -749,6 +766,11 @@ public final class MainActivity extends Activity {
             }
         }
 
+        String strip = BmsStatus.line(r);
+        set(statusStrip, strip);
+        statusStrip.setVisibility(strip.isEmpty() ? View.GONE : View.VISIBLE);
+        statusStrip.setTextColor(BmsStatus.derating(r) ? WARN : MUTED);
+
         if (r.cellDeltaMv != null) {
             long d = Math.round(r.cellDeltaMv);
             // The limit in force, which follows this pack's own rest spread.
@@ -808,6 +830,7 @@ public final class MainActivity extends Activity {
         deltaSub.setVisibility(View.GONE);
         alertView.setVisibility(View.GONE);
         hintView.setVisibility(View.GONE);
+        statusStrip.setVisibility(View.GONE);
     }
 
 
@@ -912,7 +935,8 @@ public final class MainActivity extends Activity {
             text.setText("No battery controller answered at any address this app knows. "
                     + (extras.isEmpty() ? ""
                         : "ECUs did answer at: " + extras + " - one of them may be it. ")
-                    + "If you know this car's address, enter it (three hex digits, like 785).");
+                    + "If you know this car's address, enter it - three hex digits "
+                    + "like 785, or the eight of a 29-bit id like 18DA96F1.");
             final EditText addr = new EditText(this);
             addr.setHint("e.g. 785");
             addr.setTextColor(TEXT);
@@ -920,12 +944,13 @@ public final class MainActivity extends Activity {
             troubleBox.addView(addr);
             TextView go = flatButton("Try this address", OK, v -> {
                 String id = addr.getText().toString().trim();
-                if (!CommandGuard.isRequestId(id)) {
-                    Toast.makeText(this, "Three hex digits up to 7F7, like 785",
-                            Toast.LENGTH_SHORT).show();
+                if (!CommandGuard.isRequestId(id) && !CommandGuard.isExtendedRequestId(id)) {
+                    Toast.makeText(this, "Three hex digits up to 7F7 like 785, "
+                            + "or eight like 18DA96F1", Toast.LENGTH_SHORT).show();
                     return;
                 }
                 prefs.setBmsRequestId(id, true);
+                prefs.setBmsProtocol(id.length() == 8 ? "ATTP7" : "");
                 startMonitoring();
             });
             troubleBox.addView(go, new LinearLayout.LayoutParams(

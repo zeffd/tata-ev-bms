@@ -27,6 +27,13 @@ final class Prefs {
         return "";
     }
 
+    final java.util.Map<String, String> scales = new java.util.HashMap<>();
+
+    String scaleOverride(String roleKey) {
+        String s = scales.get(roleKey);
+        return s == null ? "" : s;
+    }
+
     int deltaLimitMv() {
         return deltaLimit;
     }
@@ -45,5 +52,9 @@ final class Prefs {
 
     int currentZero() {
         return 32000;
+    }
+
+    String bmsProtocol() {
+        return "";
     }
 }

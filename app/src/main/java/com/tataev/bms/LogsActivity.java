@@ -125,7 +125,10 @@ public final class LogsActivity extends Activity {
             Entry[] arr = csvs.toArray(new Entry[0]);
             Arrays.sort(arr, (a, b) -> Long.compare(b.modified, a.modified));
             ui.post(() -> {
-                if (isFinishing()) return;
+                // isFinishing() alone misses a recreation (dark mode, font scale,
+                // a fold): the old instance is destroyed with isFinishing() false
+                // and this posted callback would then build into a dead view tree.
+                if (isFinishing() || isDestroyed()) return;
                 show(arr);
             });
         }, "logs-list").start();

@@ -38,6 +38,69 @@ final class ProfileMatch {
     }
 
     /**
+     * May a catalog battery-map preset be written into the ACTIVE profile?
+     *
+     * A preset is not a reading - it is fourteen or more DID overrides, a full
+     * set of scale overrides and a current calibration, replacing whatever the
+     * profile held. Two things must be true before that is allowed:
+     *
+     * <ul>
+     * <li>{@code profileResolved} - this connect actually identified the car.
+     *     When the BMS serves no VIN while the active profile IS VIN-keyed,
+     *     identifyVehicle stays on that profile and attaches NOTHING, because
+     *     it may not be that profile's car at all. Writing a $30xx preset there
+     *     is exactly the cross-vehicle contamination the app must never do: a
+     *     Nexon profile would come back with SOC at $300F and cells at
+     *     $3017/$3018, and the next Nexon connect would decode nothing.</li>
+     * <li>{@code mappedByHand} is false - a DID override, a scale override or a
+     *     preset already on the profile is the owner's decision, made on the
+     *     Scan screen, and the catalog does not get to overrule it.</li>
+     * </ul>
+     *
+     * The caller has already established that this controller HAS a preset;
+     * this is only the "may I write to this profile?" half, kept pure so the
+     * self-test can pin it. ScanActivity.writeBlockedForActive implements the
+     * same rule for the scan path.
+     */
+    static boolean mayApplyPreset(boolean profileResolved, boolean mappedByHand) {
+        return profileResolved && !mappedByHand;
+    }
+
+    /**
+     * Is anything on one profile's battery map set by hand or by an earlier
+     * preset? The {@code mappedByHand} half of {@link #mayApplyPreset}, kept
+     * pure so the self-test can drive the prefix scan directly.
+     *
+     * {@code prefix} is the profile's settings prefix - "" for profile 1, which
+     * keeps the legacy un-prefixed keys, and "p&lt;id&gt;_" otherwise. The scan
+     * is by {@code startsWith}, and that is exactly why it needs pinning: for
+     * profile 1 the prefix is {@code did_override_}, which "p2_did_override_x"
+     * does not start with, and for profile 2 it is {@code p2_did_override_},
+     * which "p20_did_override_x" does not start with (index 2 is '0', not '_').
+     * A regression either way re-opens the cross-vehicle contamination the
+     * preset gate exists to prevent.
+     *
+     * Values are checked, not just keys: Scan writes an EMPTY scale override to
+     * mean "decode with the built-in kind", which is not a mapping.
+     *
+     * Scans exactly the key space Prefs.clearAllDidOverrides clears, so the
+     * "mapped" question and the "reset" button can never disagree.
+     */
+    static boolean anyMapping(java.util.Map<String, ?> all, String prefix, String presetName) {
+        if (presetName != null && !presetName.isEmpty()) return true;
+        if (all == null) return false;
+        String p = (prefix == null ? "" : prefix) + "did_override_";
+        String s = (prefix == null ? "" : prefix) + "scale_override_";
+        for (java.util.Map.Entry<String, ?> e : all.entrySet()) {
+            String k = e.getKey();
+            if (k == null || (!k.startsWith(p) && !k.startsWith(s))) continue;
+            Object v = e.getValue();
+            if (v instanceof String && !((String) v).isEmpty()) return true;
+        }
+        return false;
+    }
+
+    /**
      * Extract a Tata VIN from an identity string, or "".
      *
      * F190 on the Nexon EV Max carries more than the VIN - a model-year prefix

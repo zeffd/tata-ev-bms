@@ -17,7 +17,7 @@ android {
             // Both of these are deliberate for a SIDELOADED diagnostic tool, and
             // both must change before this goes anywhere else:
             //
-            //  * minifyEnabled false - a 70 KB APK gains almost nothing from R8,
+            //  * minifyEnabled false - a ~125 KB APK gains almost nothing from R8,
             //    and an obfuscated stack trace from a car park is worth less than
             //    the few KB saved.
             //  * signingConfig debug - lets a release build install straight from
@@ -45,5 +45,5 @@ android {
 }
 
 // No AndroidX / no Compose: the framework classes cover everything this app needs,
-// which keeps the whole APK under 100 KB.
+// which keeps the whole APK around 125 KB.
 dependencies { }

@@ -16,7 +16,8 @@ mkdir -p "$OUT/src/com/tataev/bms"
 # Pure classes from the app, plus the test doubles and the test itself.
 for f in UdsCodec BmsFields DidScanner CommandGuard Alerter Reading Beeper \
          PackMap LogReader ProfileMatch Palette PackReport LogSummary PackHistory \
-         CurrentCalibration CsvFormat PollPlan ZeroCheck; do
+         CurrentCalibration CsvFormat PollPlan ZeroCheck BmsStatus AdapterCaps \
+         ProtocolLadder Presets; do
     cp "app/src/main/java/com/tataev/bms/$f.java" "$OUT/src/com/tataev/bms/"
 done
 cp selftest/com/tataev/bms/*.java "$OUT/src/com/tataev/bms/"

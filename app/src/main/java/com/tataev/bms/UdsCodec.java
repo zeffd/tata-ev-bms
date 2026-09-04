@@ -99,8 +99,15 @@ final class UdsCodec {
 
         if (text == null) return out;
         for (String rawLine : text.replace('\r', '\n').split("\n")) {
-            String line = rawLine.trim().replace(" ", "");
-            if (line.isEmpty() || isJunk(line) || line.length() <= idLen) continue;
+            // Junk BEFORE the spaces come out: the list holds multi-word adapter
+            // messages ("NO DATA", "BUFFER FULL"), and against a stripped line
+            // those could never match, so five of the nine entries were dead and
+            // the messages were being filtered only by failing the hex gate
+            // below. A list that reads as a safety net has to be one.
+            String spaced = rawLine.trim();
+            if (isJunk(spaced)) continue;
+            String line = spaced.replace(" ", "");
+            if (line.isEmpty() || line.length() <= idLen) continue;
 
             String cid = line.substring(0, idLen).toUpperCase(Locale.ROOT);
             String payload = line.substring(idLen).toUpperCase(Locale.ROOT);
@@ -196,17 +203,32 @@ final class UdsCodec {
      * Every CAN id that produced any decodable frame in this text. After a
      * functional-broadcast probe the IDS are the whole yield - each one is an
      * ECU announcing it exists; the payloads do not matter.
+     *
+     * @param idLen 3 for 11-bit ids, 8 for 29-bit: the adapter prints whichever
+     *              protocol is selected, and the two cannot be told apart from
+     *              the text alone.
      */
+    static List<String> respondingIds(String text, int idLen) {
+        return new java.util.ArrayList<>(reassembleAll(text, idLen).keySet());
+    }
+
     static List<String> respondingIds(String text) {
-        return new java.util.ArrayList<>(reassembleAll(text, 3).keySet());
+        return respondingIds(text, 3);
     }
 
     /**
-     * The request id an ECU answering on {@code responseId} listens on. The
-     * reply convention is request + 8 - Tata's 0x7xx block and ISO's 7E0/7E8
-     * both follow it. Null when the arithmetic leaves the usable range.
+     * The request id an ECU answering on {@code responseId} listens on.
+     *
+     * 11-bit: reply = request + 8 - Tata's 0x7xx block and ISO's 7E0/7E8 both
+     * follow it. 29-bit physical: the low two bytes are (target, source), so
+     * a reply on 18DAF196 came from a request to 18DA96F1. Null when the id is
+     * neither shape or the arithmetic leaves the usable range.
      */
     static String requestIdFor(String responseId) {
+        if (responseId == null) return null;
+        if (responseId.length() == 8 && CommandGuard.isHex(responseId)) {
+            return swapLowBytes(responseId);
+        }
         try {
             int resp = Integer.parseInt(responseId, 16);
             int req = resp - 8;
@@ -215,6 +237,26 @@ final class UdsCodec {
         } catch (NumberFormatException e) {
             return null;
         }
+    }
+
+    /** The id an ECU replies on when asked at {@code requestId}; the inverse of the above. */
+    static String responseIdFor(String requestId) {
+        if (requestId == null) return null;
+        if (requestId.length() == 8 && CommandGuard.isHex(requestId)) {
+            return swapLowBytes(requestId);
+        }
+        if (requestId.length() != 3 || !CommandGuard.isHex(requestId)) return null;
+        int req = Integer.parseInt(requestId, 16);
+        if (req + 8 > 0x7FF) return null;
+        // Locale.ROOT: under a non-Latin numbering system %X emits other digits,
+        // and the id would never match the ASCII the adapter prints.
+        return String.format(java.util.Locale.ROOT, "%03X", req + 8);
+    }
+
+    /** PPDAttss -> PPDAsstt: the 29-bit target/source swap. */
+    private static String swapLowBytes(String id) {
+        String up = id.toUpperCase(java.util.Locale.ROOT);
+        return up.substring(0, 4) + up.substring(6, 8) + up.substring(4, 6);
     }
 
     static Map<String, byte[]> reassemble(String text, int idLen) {
@@ -263,7 +305,8 @@ final class UdsCodec {
     }
 
     static Response decode22(String text, String expectedId) {
-        byte[] payload = reassemble(text, 3).get(expectedId);
+        if (expectedId == null) return null;
+        byte[] payload = reassemble(text, expectedId.length()).get(expectedId);
         if (payload == null || payload.length == 0) return null;
 
         if ((payload[0] & 0xFF) == 0x7F) {

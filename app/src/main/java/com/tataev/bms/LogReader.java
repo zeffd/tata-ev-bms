@@ -76,6 +76,9 @@ final class LogReader {
             int cMax = col(at, "cell_max_mv");
             int cCur = col(at, "current_a");
             int cVer = col(at, "app_ver");
+            // What the file says its own layout is; absent on every log written
+            // before the column existed, which is exactly "layout 1".
+            int cLayout = col(at, "layout");
             // Optional: the map works without it, but with it the screen can
             // say how low the drive went and who held the rest floor per band.
             int cSoc = col(at, "soc_pct");
@@ -84,13 +87,15 @@ final class LogReader {
             int cVin = col(at, "vin");
             hasVin = cVin >= 0;
 
-            // Peek at the first data row for the WRITING app's version: whether
-            // the DID correction below may apply depends on it, and the columns
-            // must be decided before the row loop.
+            // Peek at the first data row for the WRITING app's layout and
+            // version: whether the DID correction below may apply depends on
+            // them, and the columns must be decided before the row loop.
             String firstData = in.readLine();
+            String layout = null;
             if (firstData != null) {
                 String[] f0 = firstData.split(",", -1);
                 if (cVer >= 0 && cVer < f0.length) version = f0[cVer].trim();
+                if (cLayout >= 0 && cLayout < f0.length) layout = f0[cLayout].trim();
                 if (cVin >= 0 && cVin < f0.length) {
                     vin = f0[cVin].trim().toUpperCase(Locale.ROOT);
                 }
@@ -98,7 +103,7 @@ final class LogReader {
 
             int cMinIdxVal;
             int cMaxIdxVal;
-            if (flipEra(version)) {
+            if (flipEra(version, layout)) {
                 // Resolve the two index columns by DID, not by the name they
                 // carry - but ONLY for logs written before the v3.3 flip. A
                 // newer log's role columns already reflect the effective
@@ -184,6 +189,37 @@ final class LogReader {
             }
         }
         return new Result(map, rows, corrected, version, vin, hasVin);
+    }
+
+    /**
+     * True when this log may carry the pre-v3.3 index flip, so the DID-based
+     * correction applies - given what the file says about itself.
+     *
+     * The layout column decides when the file has one: layout 2 and up says the
+     * index role names are as written, whatever the version string reads. This
+     * matters because versionName is "1.1" and frozen, so flipEra(version)
+     * alone calls every log this build writes a pre-v3.3 one and inverts a
+     * deliberate "Swap min and max index" on replay.
+     *
+     * No layout column, or one this reader cannot parse, falls back to the
+     * version exactly as before: every log already on a phone behaves as it
+     * always has.
+     */
+    static boolean flipEra(String version, String layout) {
+        if (layoutAtLeast(layout, LAYOUT_POST_FLIP)) return false;
+        return flipEra(version);
+    }
+
+    /** The first layout number that declares "indices are as the names say". */
+    private static final int LAYOUT_POST_FLIP = 2;
+
+    private static boolean layoutAtLeast(String layout, int least) {
+        if (layout == null) return false;
+        try {
+            return Integer.parseInt(layout.trim()) >= least;
+        } catch (RuntimeException e) {
+            return false;
+        }
     }
 
     /**
