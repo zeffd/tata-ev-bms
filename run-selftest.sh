@@ -60,5 +60,7 @@ if grep -rnE 'VECU_MIRROR|looksLikeMirror|plausibleMirror|MirrorUse|probeBmsFirs
     echo "FAIL: removed BMS-only feature symbol found above"; exit 1
 fi
 
-javac -d "$OUT/classes" "$OUT/src/com/tataev/bms/"*.java
-java -cp "$OUT/classes" com.tataev.bms.SelfTest
+# UTF-8 explicitly: the sources carry ±, · and Ω, and javac otherwise takes the
+# platform default, which on a C-locale runner is US-ASCII and fails to compile.
+javac -encoding UTF-8 -d "$OUT/classes" "$OUT/src/com/tataev/bms/"*.java
+java -Dfile.encoding=UTF-8 -cp "$OUT/classes" com.tataev.bms.SelfTest
