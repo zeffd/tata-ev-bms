@@ -46,8 +46,11 @@ final class CsvFormat {
         // The DID rides in the name, so a Scan-remapped log still says where each
         // number came from: raw_pack_v_3400, or raw_pack_v_3500 on another model.
         for (BmsFields.Field f : logged) {
-            sb.append(",raw_").append(f.key).append('_')
-              .append(BmsFields.effectiveDid(f, prefs));
+            String did = BmsFields.effectiveDid(f, prefs);
+            // A role switched off on this car has no DID to name. "none" is not
+            // four hex digits, so LogReader - which finds a column by looking for
+            // its DID suffix - simply never matches it, and the column stays blank.
+            sb.append(",raw_").append(f.key).append('_').append(did == null ? "none" : did);
         }
         sb.append(",app_ver,layout,bms_id,cur_scale,cur_zero,vin");
         return sb.toString();

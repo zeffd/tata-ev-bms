@@ -6,6 +6,8 @@ adapter — and helps find a weak cell group before it strands you.
 
 Reverse-engineered on a 2023 Nexon EV Max; designed to work across Tata's EV
 range (Nexon, Tiago, Punch, Curvv) because nothing model-specific is hardcoded.
+The one fixed value is the battery controller's address, which is the address
+Tata's own diagnostic tool uses across that range.
 
 > **Unofficial.** This project is not affiliated with or endorsed by Tata Motors.
 > It is a diagnostic tool you run against your own car, at your own risk.
@@ -19,7 +21,10 @@ range (Nexon, Tiago, Punch, Curvv) because nothing model-specific is hardcoded.
   and strongest cell group per sample; accumulated over a drive, that is enough
   to tell **charge imbalance** (fixed by a full charge) from **high internal
   resistance** (a service item) and to put a measured milliohm figure on the
-  bad group. Verdicts are plain-language: *weak module*, *watch*, *low charge*.
+  bad group. Tap any group to see the last four moments it was the weakest or
+  strongest - time, voltage, offset from the pack's average group, current -
+  and its mean offset at rest and under load. Verdicts are plain-language:
+  *weak module*, *watch*, *low charge*.
 - **All drives** — every logged drive replayed and tallied per group, so "the
   same group in 3 of 3 drives" is one screen, with a shareable findings report.
 - **Alerts** while you drive: cell spread, weakest-cell floor, the *knee* (a
@@ -61,8 +66,8 @@ Grab the APK from the [Releases](../../releases) page, or build it yourself
    connects to an already-paired device.
 2. Close any other OBD app (Car Scanner etc.): these adapters accept **one**
    connection at a time.
-3. Open the app with the car awake. The BMS is auto-detected; the car is
-   named by VIN on first connect.
+3. Open the app with the car awake. The app talks to the battery controller
+   at 785; the car is named by VIN on first connect.
 
 The APK is debug-signed on purpose (it is a sideloaded diagnostic tool);
 installing a build signed by a different machine requires uninstalling first,
@@ -75,26 +80,22 @@ ELM327 sold under $10 is a clone, and some clones refuse commands the genuine
 chip accepts. The app copes with the common ones — a missing receive filter
 (replies are filtered in software) and missing flow control (long replies are
 read as far as they arrive) — and records what the adapter refused at the top
-of the **detection report**, so a failure can be diagnosed from one shared file.
+of the **poll report**, so a failure can be diagnosed from one shared file.
 
-If the dashboard stops at *Could not find a battery controller*, tap **Share
-detection report** on that card and send the file. It names the adapter, the
-commands it rejected, every protocol tried and every address that answered. It
-contains no VIN.
+If the app connects but the dashboard stays empty, the card offers that **poll
+report**: what was asked and what the controller answered, with no VIN. Share
+that file the same way.
 
-What the app tries, in order, before giving up: the Nexon's 0x7xx addresses on
-11-bit CAN at 500 kbaud, a broadcast to the whole bus, then 29-bit CAN at the
-addresses Tata's own service tool uses for its battery controllers. The
-250 kbaud variants of both come only on the retry, and only after a sweep in
-which the car said nothing at all — a car that is not switched on yet looks
-exactly like a 250 kbaud one, and probing 250 kbaud on a live 500 kbaud bus
-puts error frames on it. A car whose battery controller answers on 29-bit is
-remembered and reconnects directly next time.
+The app talks to one address only: the battery controller at 785 on 11-bit CAN at
+500 kbaud, which is where Tata's own diagnostic tool finds it across the passenger
+range.
+Nothing else on the bus is ever asked. If the adapter prints nothing the card says
+the adapter is not answering; if 785 does not reply on two connects the card says
+so and asks whether the car is on; if it answers in codes the app does not know,
+**Scan vehicle** maps it.
 
-Two kinds of battery controller are understood without any mapping: the
-Gotion controller (Nexon EV and EV Max) and the TacoGotion / CESL / Kratos
-family, which serves the same readings at different codes and scales. A model
-with something else answers in unknown codes, and **Scan vehicle** maps it.
+The Gotion battery controller (Nexon EV and EV Max) is understood without any
+mapping.
 
 ## On a Tata model with a different DID map
 
@@ -103,6 +104,10 @@ Nothing breaks: unknown DIDs read `--`, the cell-group count is **derived**
 space on the car itself, suggests a mapping for the roles it can identify
 reliably, and leaves genuinely ambiguous choices (pack volts vs cell millivolts
 overlap numerically) to a human, with the coherent candidates listed.
+
+If a scan could not read the car's VIN while the profile is bound to one, the app
+asks whether it is the same car before applying anything; a scan whose VIN
+belongs to a different car is never applied.
 
 ## How the pack map works, in one paragraph
 
@@ -128,7 +133,7 @@ JDK 17; the Gradle wrapper fetches the rest (Android SDK 35 via `ANDROID_HOME`).
 Run the self-test — pure `javac`/`java`, no JUnit, no network, no device:
 
 ```bash
-./run-selftest.sh   # 694 assertions against real captured frames
+./run-selftest.sh   # 725 assertions against real captured frames
 ```
 
 Pushing a `v*` tag builds the APK in CI and attaches it to a GitHub release.

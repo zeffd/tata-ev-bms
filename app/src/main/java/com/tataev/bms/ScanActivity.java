@@ -1,6 +1,7 @@
 package com.tataev.bms;
 
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothManager;
@@ -124,6 +125,11 @@ public final class ScanActivity extends Activity {
         }
     };
     private Prefs prefs;
+    /**
+     * The owner confirmed this scan is the profile's car despite a failed VIN
+     * read. Instance state on purpose: it lasts this screen visit only.
+     */
+    private boolean sameCarConfirmed;
     private TextView status;
     private TextView results;
     private Button startBtn;
@@ -342,75 +348,28 @@ public final class ScanActivity extends Activity {
                 return;
             }
 
-            String bmsId = prefs.bmsRequestId();
-            boolean detected = false;
-            elm.useProtocol(ProtocolLadder.atspForId(bmsId, prefs.bmsProtocol()));
-            if (bmsId == null || bmsId.isEmpty()) {
-                setStatus("Locating BMS...");
-                ElmClient.BmsInfo info = elm.detectBms(BmsFields.BMS_CANDIDATES,
-                        msg -> setStatus(msg));
-                if (info == null) {
-                    setStatus("Could not find a BMS on 11-bit CAN. Connect from the "
-                            + "dashboard first - it searches every protocol and saves "
-                            + "what it finds - then scan.");
-                    return;
-                }
-                bmsId = info.requestId;
-                detected = true;
-                // Saved LATER, after the VIN read below: the scanned car may not
-                // be the active profile's car, and saving now would pin its
-                // address on the wrong profile.
+            final String bmsId = BmsFields.BMS_REQUEST;
+            setStatus("Checking the battery controller at " + bmsId + "...");
+            elm.initAdapter();
+            ConnectPlan.Probe probe = elm.probeBms();
+            if (probe != ConnectPlan.Probe.ANSWERED) {
+                setStatus(probe == ConnectPlan.Probe.ADAPTER_SILENT
+                        ? BmsFields.MSG_ADAPTER_SILENT : BmsFields.MSG_NO_REPLY);
+                return;
             }
-            if (detected) {
-                // detectBms already ran initAdapter(); repeating it is a second
-                // ATZ hardware reset that discards the addressing just set up.
-                elm.targetAndOpenSession(bmsId);
-            } else {
-                elm.initAndTargetBms(bmsId);
-                // Prove the address before sweeping tens of thousands of DIDs
-                // against it. ATSH/ATCRA are adapter-local and answer OK for any
-                // address at all, so an address saved from a different vehicle
-                // produced a full sweep of silence and then reported "0 DIDs
-                // answered / Scan complete" - which reads as "this BMS has no
-                // data" rather than "wrong address".
-                //
-                // Any UDS reply proves it, including a negative one. Deliberately
-                // NOT a check that some KNOWN DID answers: a vehicle whose map
-                // differs from the Nexon's is precisely the vehicle this screen
-                // exists to serve, and it would fail that test while being
-                // perfectly scannable.
-                //
-                // For the same reason the fallback asks for the DID this vehicle
-                // actually uses rather than the hardcoded Nexon default. On an ECU
-                // that stays silent for a DID it does not serve, probing 3402 on a
-                // model already remapped away from it would refuse to scan the one
-                // vehicle this screen is for - and the advice it prints, forget the
-                // address and scan again, would not help.
-                if (!elm.respondsAtAll(BmsFields.DID_SYSTEM_NAME)
-                        && !elm.respondsAtAll(
-                                BmsFields.effectiveDid(BmsFields.ALL.get(0), prefs))) {
-                    setStatus("BMS " + bmsId + " is not answering. Connect from the "
-                            + "dashboard first - it finds the battery controller again - "
-                            + "then scan.");
-                    return;
-                }
-            }
+            elm.enterExtendedSession();
             if (cancelledStatic) {
                 setStatus("Stopped");
                 return;
             }
-            // Which car is being scanned - so a freshly detected address is not
-            // pinned onto a profile belonging to a different vehicle. Held in a
-            // LOCAL until the results publish below: the static store carries
-            // the PREVIOUS sweep's results for the whole duration of this one,
-            // and publishing the new VIN early would pair those old results
-            // with this car's identity for tens of minutes.
+            // Which car is being scanned - the gate that decides whether this
+            // sweep may write to the active profile. Held in a LOCAL until the
+            // results publish below: the static store carries the PREVIOUS
+            // sweep's results for the whole duration of this one, and publishing
+            // the new VIN early would pair those old results with this car's
+            // identity for tens of minutes.
             final String scannedVin = ProfileMatch.extractVin(
                     elm.readIdString(BmsFields.DID_VIN));
-            if (detected && !writeBlockedForActive(scannedVin)) {
-                prefs.setBmsRequestId(bmsId);
-            }
-            final String usedId = bmsId;
 
             DidScanner scanner = new DidScanner();
             // Give the anchor search the DIDs this vehicle actually uses, so a
@@ -419,7 +378,8 @@ public final class ScanActivity extends Activity {
             java.util.List<String> anchors = new java.util.ArrayList<>();
             for (BmsFields.Field f : BmsFields.ALL) {
                 String did = BmsFields.effectiveDid(f, prefs);
-                if (!anchors.contains(did)) anchors.add(did);
+                // null = switched off on this car: it anchors nothing.
+                if (did != null && !anchors.contains(did)) anchors.add(did);
             }
             scanner.setAnchorCandidates(anchors);
             final android.os.PowerManager.WakeLock held = lock;
@@ -471,10 +431,16 @@ public final class ScanActivity extends Activity {
             try {
                 String when = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.ROOT)
                         .format(new java.util.Date());
-                String preamble = String.format(Locale.ROOT, "Scanned: %04X-%04X\nWhen: %s\nApp: %s\n",
-                        from, to, when, CsvLogger.appVersion(this)) + elm.caps().report();
+                // How identification went, as outcomes - never the VIN itself. A
+                // scan that looks VIN-less because the read was refused is a
+                // different story from one on a car that serves no VIN at all.
+                String preamble = String.format(Locale.ROOT,
+                        "Scanned: %04X-%04X\nWhen: %s\nApp: %s\nVIN read: %s\nSession: %s\n",
+                        from, to, when, CsvLogger.appVersion(this),
+                        elm.lastVinReadOutcome(), elm.lastSessionOutcome())
+                        + elm.caps().report();
                 lastReport = DidScanner.writeReport(
-                        CsvLogger.logsDir(this), usedId, preamble, hits, suggestion, analysis,
+                        CsvLogger.logsDir(this), bmsId, preamble, hits, suggestion, analysis,
                         scanner.linkLost()
                                 ? String.format(Locale.ROOT,
                                         "LINK LOST at DID %04X - PARTIAL RESULTS: every "
@@ -667,20 +633,59 @@ public final class ScanActivity extends Activity {
                 m.put("pack_v", h.packDid);
                 m.put("cell_max_mv", h.cellMaxDid);
                 m.put("cell_min_mv", h.cellMinDid);
-                if (applyOverrides(m)) {
-                    // The unit travels with the choice: a 10 mV controller's
-                    // cells decode to millivolts through a scale override, so
-                    // every downstream role keeps reading mV.
-                    String cellScale = h.cellUnitMv == 10 ? "10;0;2" : "";
-                    prefs.setScaleOverride("cell_max_mv", cellScale);
-                    prefs.setScaleOverride("cell_min_mv", cellScale);
-                    prefs.setScaleOverride("pack_v", "");
-                    Toast.makeText(this, String.format(Locale.ROOT,
-                            "Set pack=%s, max=%s, min=%s (%.0f groups%s)",
-                            h.packDid, h.cellMaxDid, h.cellMinDid, h.series,
-                            h.cellUnitMv == 10 ? ", cells in 10 mV" : ""),
-                            Toast.LENGTH_LONG).show();
+                // A reading may take a logged-only role's code by switching that
+                // role off, but never a tile's. Without this the reading the scan
+                // ranks first can be permanently unappliable on a car where it
+                // lands on 3482.
+                Map<String, String> others = new java.util.LinkedHashMap<>();
+                for (BmsFields.Field f : BmsFields.ALL) {
+                    if (!m.containsKey(f.key)) others.put(f.key, BmsFields.effectiveDid(f, prefs));
                 }
+                DidScanner.ApplyPlan plan = DidScanner.planApply(m, others);
+                if (plan.refusal != null) {
+                    Toast.makeText(this, "Not applied: " + plan.refusal,
+                            Toast.LENGTH_LONG).show();
+                    return;
+                }
+                // Switched off FIRST, because applyOverrides' own clash check is
+                // what would otherwise refuse this pick - a disabled role reports
+                // no DID, so it no longer owns the code. That means undoing them
+                // exactly if the write is then refused for another reason (the
+                // VIN guard), rather than leaving a role off for nothing.
+                List<String> switchedOff = new java.util.ArrayList<>();
+                Map<String, String> priorDid = new java.util.LinkedHashMap<>();
+                Map<String, String> priorScale = new java.util.LinkedHashMap<>();
+                for (String role : plan.disable) {
+                    priorDid.put(role, prefs.didOverride(role));
+                    priorScale.put(role, prefs.scaleOverride(role));
+                    prefs.setDidOverride(role, BmsFields.DISABLED);
+                    prefs.setScaleOverride(role, "");
+                    BmsFields.Field o = BmsFields.byKey(role);
+                    switchedOff.add(o == null ? role : o.label);
+                }
+                if (!applyOverrides(m)) {
+                    for (String role : plan.disable) {
+                        prefs.setDidOverride(role, priorDid.get(role));
+                        prefs.setScaleOverride(role, priorScale.get(role));
+                    }
+                    return;
+                }
+                // The unit travels with the choice: a 10 mV controller's cells
+                // decode to millivolts through a scale override, so every
+                // downstream role keeps reading mV.
+                String cellScale = h.cellUnitMv == 10 ? "10;0;2" : "";
+                prefs.setScaleOverride("cell_max_mv", cellScale);
+                prefs.setScaleOverride("cell_min_mv", cellScale);
+                prefs.setScaleOverride("pack_v", "");
+                Toast.makeText(this, String.format(Locale.ROOT,
+                        "Set pack=%s, max=%s, min=%s (%.0f groups%s)%s",
+                        h.packDid, h.cellMaxDid, h.cellMinDid, h.series,
+                        h.cellUnitMv == 10 ? ", cells in 10 mV" : "",
+                        switchedOff.isEmpty() ? ""
+                                : ". " + android.text.TextUtils.join(", ", switchedOff)
+                                        + " is no longer read on this car; Reset to "
+                                        + "default DIDs restores it"),
+                        Toast.LENGTH_LONG).show();
             });
             hypothesisBox.addView(b);
         }
@@ -778,8 +783,27 @@ public final class ScanActivity extends Activity {
             return;
         }
         if (refuseWhileLive()) return;
-        if (applyOverrides(lastSuggestion)) {
-            Toast.makeText(this, lastSuggestion.size() + " DIDs mapped",
+        // Drop the roles that collide instead of refusing the whole apply. A
+        // suggestion can name a DID an earlier pick already gave to
+        // another role - 3421 read as SOH on a car where it is SOC - and
+        // refusing everything for that left the temperatures unmappable too.
+        Map<String, String> others = new java.util.LinkedHashMap<>();
+        for (BmsFields.Field f : BmsFields.ALL) {
+            if (!lastSuggestion.containsKey(f.key)) {
+                others.put(f.key, BmsFields.effectiveDid(f, prefs));
+            }
+        }
+        List<String> skipped = new java.util.ArrayList<>();
+        Map<String, String> kept = DidScanner.withoutClashes(lastSuggestion, others, skipped);
+        if (kept.isEmpty()) {
+            Toast.makeText(this, "Nothing applied - every suggested code is already "
+                    + "another reading's: " + android.text.TextUtils.join(", ", skipped),
+                    Toast.LENGTH_LONG).show();
+            return;
+        }
+        if (applyOverrides(kept)) {
+            Toast.makeText(this, kept.size() + " DIDs mapped"
+                    + (skipped.isEmpty() ? "" : ", skipped: " + android.text.TextUtils.join(", ", skipped)),
                     Toast.LENGTH_LONG).show();
         }
     }
@@ -806,30 +830,38 @@ public final class ScanActivity extends Activity {
     }
 
     /**
+     * The one question this screen cannot answer for itself.
+     *
+     * Confirmation lasts the screen visit, not the install: leaving and coming
+     * back asks again, because the car in front of the owner may have changed.
+     */
+    private void askSameCar() {
+        new AlertDialog.Builder(this)
+                .setTitle("Same car?")
+                .setMessage("This scan read no VIN from the car, but this profile ("
+                        + prefs.profileName(prefs.activeProfile())
+                        + ") is bound to one. If this is the same car, the mapping can be "
+                        + "applied. If it might be a different car, cancel - a mapping "
+                        + "written into the wrong profile corrupts that car's readings.")
+                .setPositiveButton("Yes, same car", (d, w) -> {
+                    sameCarConfirmed = true;
+                    Toast.makeText(this, "Confirmed. Tap the reading or mapping again "
+                            + "to apply it.", Toast.LENGTH_LONG).show();
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    /**
      * May scan data be written into the ACTIVE profile? Blocked on a known
      * conflict, and - the same policy BmsService.identifyVehicle applies on its
      * unresolved path - when the scanned car returned no VIN while the active
      * profile IS VIN-keyed: this may not be that profile's car at all.
      */
-    private boolean writeBlockedForActive(String scanned) {
-        if (vinConflictsWithActive(scanned)) return true;
-        return (scanned == null || scanned.isEmpty())
-                && !prefs.profileVin(prefs.activeProfile()).isEmpty();
-    }
-
-    /**
-     * Does writing this car's data into the ACTIVE profile conflict with what
-     * the app knows? Two ways it can: the active profile is keyed to a
-     * different VIN, or the scanned VIN already belongs to another profile.
-     * An unknown VIN on both sides is not a conflict - there is nothing to know.
-     */
-    private boolean vinConflictsWithActive(String scanned) {
-        if (scanned == null || scanned.isEmpty()) return false;
+    private ProfileMatch.ScanGate gateFor(String scannedVin) {
         int active = prefs.activeProfile();
-        String activeVin = prefs.profileVin(active);
-        if (!activeVin.isEmpty()) return !scanned.equals(activeVin);
-        int owner = prefs.profileByVin(scanned);
-        return owner > 0 && owner != active;
+        return ProfileMatch.scanWriteGate(scannedVin, prefs.profileVin(active),
+                prefs.profileByVin(scannedVin == null ? "" : scannedVin), active);
     }
 
     /**
@@ -854,15 +886,21 @@ public final class ScanActivity extends Activity {
                     + "screen are from the previous sweep", Toast.LENGTH_LONG).show();
             return false;
         }
-        if (writeBlockedForActive(lastResultVin)) {
-            String why = vinConflictsWithActive(lastResultVin)
-                    ? "This scan is from a different vehicle (VIN " + lastResultVin
-                            + ") than the active profile."
-                    : "This scan read no VIN, but the active profile is bound to "
-                            + "one - it may be a different car.";
-            Toast.makeText(this, why + " Connect on the main screen first so the "
-                    + "app switches to the right profile, then re-scan and apply.",
-                    Toast.LENGTH_LONG).show();
+        ProfileMatch.ScanGate gate = gateFor(lastResultVin);
+        if (gate == ProfileMatch.ScanGate.BLOCK_DIFFERENT_CAR) {
+            Toast.makeText(this, "This scan is from a different vehicle (VIN "
+                    + lastResultVin + ") than the active profile. Connect on the main "
+                    + "screen first so the app switches to the right profile, then "
+                    + "re-scan and apply.", Toast.LENGTH_LONG).show();
+            return false;
+        }
+        if (gate == ProfileMatch.ScanGate.ASK_SAME_CAR && !sameCarConfirmed) {
+            // A VIN read that failed and a different VIN-less car are the same
+            // evidence. Refusing outright left an owner - whose ECU HAS
+            // served its VIN, hence the profile's name - with every button on
+            // this screen dead and no way forward. Only a person can tell these
+            // two apart, and one is standing here holding the phone.
+            askSameCar();
             return false;
         }
         Map<String, String> effective = new java.util.LinkedHashMap<>();

@@ -284,6 +284,13 @@ public final class PackMapActivity extends MapScreen {
     String describe(int index) {
         if (index < 0) return "Tap a group.";
         PackMap.Snapshot g = current.snapshot(index);
+        String head = describeVerdict(index, g);
+        String history = GroupMoments.render(g, java.util.TimeZone.getDefault());
+        return history.isEmpty() ? head : head + "\n\n" + history;
+    }
+
+    /** Today's one- or two-sentence verdict, unchanged. */
+    private String describeVerdict(int index, PackMap.Snapshot g) {
         if (g == null || !g.seen) {
             return "Group " + index + " - never the weakest or strongest in any sample.";
         }

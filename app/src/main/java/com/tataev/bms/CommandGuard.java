@@ -37,24 +37,20 @@ final class CommandGuard {
             "ATS0",         // spaces off
             "ATH1",         // headers on - we must see which ECU replied
             "ATCAF1",       // CAN auto-formatting on
-            "ATSP6",        // ISO 15765-4, CAN 11-bit, 500 kbaud - the DEFAULT wire
-                            // path, and the only protocol select allowed to
-                            // persist to the adapter's EEPROM
-            "ATTP7",        // "try": ISO 15765-4, CAN 29-bit, 500 kbaud - rung 2
-            "ATTP8",        // "try": CAN 11-bit, 250 kbaud - rung 3
-            "ATTP9",        // "try": CAN 29-bit, 250 kbaud - rung 4
-                            // ATSP7/8/9 are deliberately ABSENT: writing a probe
-                            // rung to EEPROM would leave the dongle defaulting to
-                            // 29-bit or 250 kbaud for every other tool the owner
-                            // plugs in. Probes must not outlive the app.
+            "ATSP6",        // ISO 15765-4, CAN 11-bit, 500 kbaud - the ONLY wire
+                            // this app speaks, and the adapter's own default, so
+                            // persisting it to EEPROM changes nothing for the
+                            // next tool. Every other protocol select is
+                            // deliberately ABSENT: the persisting forms would
+                            // leave the dongle on another wire for the next
+                            // tool, and the probing forms went with the ladder.
             "ATAT1",        // adaptive timing
-            "ATCRA",        // bare = CLEAR the receive filter - hear every ECU
-                            // during broadcast discovery (adapter-local)
+            "ATCRA",        // bare = CLEAR the receive filter (adapter-local)
             "ATFCSD300000", // flow-control data
             "ATFCSM1",      // flow-control mode
     };
 
-    /** AT commands that take a CAN id: 3 hex digits (11-bit), 8 (29-bit), or 6 for ATSH (24-bit header after ATCP). */
+    /** AT commands that take a CAN id: 3 hex digits. */
     private static final String[] ALLOWED_AT_WITH_ID = {
             "ATSH",         // set request header
             "ATCRA",        // receive filter
@@ -112,29 +108,17 @@ final class CommandGuard {
         for (String ok : ALLOWED_AT) {
             if (c.equals(ok)) return true;
         }
-        // CAN priority byte for a 29-bit header (adapter-local): exactly two
-        // hex digits. Paired with a six-digit ATSH this is how every ELM327
-        // since v1.0 addresses a 29-bit ECU.
-        if (c.startsWith("ATCP")) {
-            String p = c.substring(4);
-            return p.length() == 2 && isHex(p);
-        }
         for (String prefix : ALLOWED_AT_WITH_ID) {
-            if (c.startsWith(prefix)
-                    && isCanId(c.substring(prefix.length()), prefix.equals("ATSH"))) {
+            if (c.startsWith(prefix) && isCanId(c.substring(prefix.length()))) {
                 return true;
             }
         }
         return false;
     }
 
-    /**
-     * An 11-bit id is three hex digits; a 29-bit id is eight. ATSH alone also
-     * takes the 24-bit form (six digits) that goes with ATCP. Nothing else.
-     */
-    private static boolean isCanId(String id, boolean allowSix) {
-        return (id.length() == 3 || id.length() == 8 || (allowSix && id.length() == 6))
-                && isHex(id);
+    /** A CAN id is three hex digits, the 11-bit form. Nothing else. */
+    private static boolean isCanId(String id) {
+        return id.length() == 3 && isHex(id);
     }
 
     /**
@@ -145,25 +129,6 @@ final class CommandGuard {
      * ELM327 cannot parse. A guard that validates something other than the bytes
      * actually transmitted is not a guard.
      */
-    /**
-     * A request id an owner may type: exactly three hex digits, at most 7F7.
-     * The ECU replies on request + 8, and 7F8 + 8 = 800 no longer fits the
-     * 11-bit id the adapter filters on - the reply would never be seen.
-     */
-    static boolean isRequestId(String id) {
-        if (id == null || id.length() != 3 || !isHex(id)) return false;
-        return Integer.parseInt(id, 16) <= 0x7F7;
-    }
-
-    /**
-     * A 29-bit physical request id as the ladder uses it: exactly eight hex
-     * digits, e.g. 18DA96F1. Detected, never typed - the address field on the
-     * dashboard stays 11-bit.
-     */
-    static boolean isExtendedRequestId(String id) {
-        return id != null && id.length() == 8 && isHex(id);
-    }
-
     static boolean isHex(String s) {
         if (s.isEmpty()) return false;
         for (int i = 0; i < s.length(); i++) {

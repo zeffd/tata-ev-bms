@@ -23,8 +23,11 @@ final class Prefs {
         return auxLow;
     }
 
+    final java.util.Map<String, String> dids = new java.util.HashMap<>();
+
     String didOverride(String roleKey) {
-        return "";
+        String d = dids.get(roleKey);
+        return d == null ? "" : d;
     }
 
     final java.util.Map<String, String> scales = new java.util.HashMap<>();
@@ -52,9 +55,5 @@ final class Prefs {
 
     int currentZero() {
         return 32000;
-    }
-
-    String bmsProtocol() {
-        return "";
     }
 }

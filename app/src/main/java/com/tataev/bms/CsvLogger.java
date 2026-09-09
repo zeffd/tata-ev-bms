@@ -108,8 +108,7 @@ final class CsvLogger {
         while (f.exists()) {
             f = new File(dir, "bms_" + stamp + "_" + (n++) + ".csv");
         }
-        bmsId = prefs.bmsRequestId();
-        if (bmsId == null || bmsId.isEmpty()) bmsId = "auto";
+        bmsId = BmsFields.BMS_REQUEST;
         vin = prefs.profileVin(prefs.activeProfile());
         writer = new FileWriter(f, false);
         openPath = f.getAbsolutePath();

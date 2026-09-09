@@ -39,7 +39,6 @@ public final class SettingsActivity extends Activity {
     private static final int ID_DELTA = 0x7F00_0002;
     private static final int ID_MIN_CELL = 0x7F00_0003;
     private static final int ID_SCALE = 0x7F00_0004;
-    private static final int ID_BMS = 0x7F00_0005;
     private static final int ID_ADAPTER = 0x7F00_0006;
     private static final int ID_ZERO = 0x7F00_0007;
     private static final int ID_LOGGING = 0x7F00_0008;
@@ -68,7 +67,6 @@ public final class SettingsActivity extends Activity {
     private EditText currentScale;
     private EditText currentZero;
     private EditText chargerKw;
-    private EditText bmsId;
     private EditText adapterName;
     private TextView calibrationStatus;
     /** The profile this screen was built for; save() refuses to write another. */
@@ -146,8 +144,8 @@ public final class SettingsActivity extends Activity {
             if (id != shownProfile) body.addView(profileRow(id));
         }
         body.addView(note("A second Tata EV gets its own entry the first time it is "
-                + "connected, matched by VIN, with its own saved address, alert "
-                + "thresholds and calibration."));
+                + "connected, matched by VIN, with its own alert thresholds and "
+                + "calibration."));
         TextView map = new TextView(this);
         map.setText("Not reading this car? Map its battery codes.");
         map.setTextSize(13);
@@ -219,8 +217,8 @@ public final class SettingsActivity extends Activity {
     private void confirmExpert() {
         new AlertDialog.Builder(this)
                 .setTitle("Show expert settings?")
-                .setMessage("Expert settings hold raw alert thresholds, the current "
-                        + "calibration and the battery controller's address. They exist "
+                .setMessage("Expert settings hold raw alert thresholds and the current "
+                        + "calibration. They exist "
                         + "for mapping a Tata model this app has not seen. Normal use never "
                         + "needs them, and they stay shown until you hide them.")
                 .setPositiveButton("Show", (d, w) -> {
@@ -238,7 +236,7 @@ public final class SettingsActivity extends Activity {
         box.setOrientation(LinearLayout.VERTICAL);
         box.addView(header("Expert"));
         box.addView(note("Raw values behind the alerts and the current reading, and the "
-                + "escape hatches for a car the automatic detection gets wrong. Save "
+                + "escape hatches for a car whose codes differ from the Nexon's. Save "
                 + "commits the typed values; the buttons only fill them in."));
 
         box.addView(header("Alert thresholds"));
@@ -295,14 +293,7 @@ public final class SettingsActivity extends Activity {
         });
         box.addView(resetCal);
 
-        box.addView(header("Battery controller"));
-        bmsId = new EditText(this);
-        bmsId.setId(ID_BMS);
-        bmsId.setText(prefs.bmsRequestId());
-        bmsId.setHint("blank = detect automatically");
-        bmsId.setTextColor(Palette.TEXT);
-        bmsId.setHintTextColor(Palette.MUTED);
-        box.addView(labelled("Address (hex, e.g. 785)", bmsId));
+        box.addView(header("Adapter"));
         adapterName = new EditText(this);
         adapterName.setId(ID_ADAPTER);
         adapterName.setText(prefs.adapterName());
@@ -310,14 +301,6 @@ public final class SettingsActivity extends Activity {
         adapterName.setTextColor(Palette.TEXT);
         adapterName.setHintTextColor(Palette.MUTED);
         box.addView(labelled("Bluetooth adapter name", adapterName));
-        Button clearIdBtn = new Button(this);
-        clearIdBtn.setText("Forget the address (detect again)");
-        clearIdBtn.setOnClickListener(v -> {
-            prefs.setBmsRequestId("");
-            bmsId.setText("");
-            Toast.makeText(this, "Will detect on next connect", Toast.LENGTH_SHORT).show();
-        });
-        box.addView(clearIdBtn);
         Button scan = new Button(this);
         scan.setText("Map a different Tata model");
         scan.setOnClickListener(v -> startActivity(new Intent(this, ScanActivity.class)));
@@ -369,7 +352,6 @@ public final class SettingsActivity extends Activity {
         java.util.List<String> rejected = new java.util.ArrayList<>();
         Integer dl = null, mc = null, kd = null, cz = null;
         Float al = null, sc = null;
-        String id = "";
 
         if (expert) {
             dl = parsed(deltaLimit);
@@ -429,11 +411,6 @@ public final class SettingsActivity extends Activity {
                 rejected.add("Zero point must be a whole number 0-65535 - kept "
                         + prefs.currentZero());
             }
-            id = bmsId.getText().toString().trim();
-            if (!isValidRequestId(id)) {
-                rejected.add("Address must be 3 hex digits up to 7F7 (e.g. 785), "
-                        + "8 hex digits for a 29-bit address, or blank");
-            }
         }
 
         if (!rejected.isEmpty()) {
@@ -449,7 +426,6 @@ public final class SettingsActivity extends Activity {
         // Atomic against identifyVehicle switching profiles on the poll thread.
         final Integer fDl = dl, fMc = mc, fKd = kd, fCz = cz;
         final Float fAl = al, fSc = sc;
-        final String fId = id;
         boolean committed = prefs.commitIfActiveProfile(shownProfile, () -> {
             String pn = profileName.getText().toString().trim();
             if (!pn.isEmpty()) prefs.setProfileName(shownProfile, pn);
@@ -460,20 +436,6 @@ public final class SettingsActivity extends Activity {
             prefs.setAuxLowV(fAl);
             prefs.setCurrentScale(fSc);
             prefs.setCurrentZero(fCz);
-            // Only a CHANGE counts as user intent: re-saving a detected address
-            // flagged "user-entered" would disable the re-detection that recovers
-            // from a stale address on a second car.
-            boolean alreadyUserEntered = prefs.bmsRequestIdIsUserEntered();
-            boolean changed = !fId.equalsIgnoreCase(prefs.bmsRequestId());
-            prefs.setBmsRequestId(fId, !fId.isEmpty() && (changed || alreadyUserEntered));
-            if (changed) {
-                // The saved protocol belongs to the OLD address. Keeping it would
-                // open a newly typed 3-digit address on the 250 kbaud or 29-bit
-                // wire the previous one answered on, so it fails twice before the
-                // ladder recovers. Let the shape of the new id decide, the way
-                // MainActivity's trouble card does.
-                prefs.setBmsProtocol(fId.length() == 8 ? "ATTP7" : "");
-            }
             prefs.setAdapterName(adapterName.getText().toString());
         });
 
@@ -570,12 +532,6 @@ public final class SettingsActivity extends Activity {
                 + " - " + typed + u + " was not saved";
     }
 
-    /** Blank (auto-detect) or a request id whose reply still fits an 11-bit CAN id. */
-    private static boolean isValidRequestId(String id) {
-        if (id == null || id.isEmpty()) return true;
-        return CommandGuard.isRequestId(id) || CommandGuard.isExtendedRequestId(id);
-    }
-
     private Integer parsed(EditText e) {
         try {
             return Integer.valueOf(e.getText().toString().trim());
@@ -652,7 +608,7 @@ public final class SettingsActivity extends Activity {
             }
             new AlertDialog.Builder(this)
                     .setTitle("Delete " + shown + "?")
-                    .setMessage("Its saved address, calibration and alert settings are "
+                    .setMessage("Its calibration, battery map and alert settings are "
                             + "removed. Log files are not touched.")
                     .setPositiveButton("Delete", (d, w) -> {
                         if (BmsService.isActive()) {

@@ -31,9 +31,9 @@
 
     <uses-feature android:name="android.hardware.bluetooth" android:required="true" />
 
-    <!-- allowBackup is OFF deliberately: the preferences hold a detected BMS
-         address and a per-vehicle current calibration, and a device restore would
-         carry one car's values onto another, where they are silently wrong. -->
+    <!-- allowBackup is OFF deliberately: the preferences hold a per-vehicle
+         current calibration and DID map, and a device restore would carry one
+         car's values onto another, where they are silently wrong. -->
     <application
         android:label="Tata EV BMS"
         android:icon="@mipmap/ic_launcher"
@@ -55,8 +55,8 @@
 
         <!-- Portrait-locked like the other two screens. Every view here is built
              in code with no id, so the framework cannot save or restore field
-             contents: a rotation mid-edit silently discarded a typed BMS address
-             and current scale. -->
+             contents: a rotation mid-edit silently discarded a half-typed
+             current scale. -->
         <activity
             android:name=".SettingsActivity"
             android:exported="false"

@@ -72,6 +72,8 @@ final class LogReader {
             }
 
             int cPack = col(at, "pack_v");
+            // The row's clock, for the group history; absent on very old logs.
+            int cEpoch = col(at, "epoch_ms");
             int cMin = col(at, "cell_min_mv");
             int cMax = col(at, "cell_max_mv");
             int cCur = col(at, "current_a");
@@ -168,7 +170,8 @@ final class LogReader {
                 // from the CSV's implied_series column: the formula is identical,
                 // and recomputing also works on a log written before that column
                 // existed.
-                Reading row = new Reading(0);
+                Long atMs = longAt(f, cEpoch);
+                Reading row = new Reading(atMs == null ? 0 : atMs);
                 row.values.put("pack_v", pack);
                 row.values.put("cell_min_mv", mn);
                 row.values.put("cell_max_mv", mx);
@@ -290,6 +293,15 @@ final class LogReader {
     private static int col(Map<String, Integer> at, String name) {
         Integer i = at.get(name);
         return i == null ? -1 : i;
+    }
+
+    private static Long longAt(String[] f, int i) {
+        if (i < 0 || i >= f.length) return null;
+        try {
+            return Long.parseLong(f[i].trim());
+        } catch (NumberFormatException e) {
+            return null;
+        }
     }
 
     private static Double num(String[] f, int i) {
