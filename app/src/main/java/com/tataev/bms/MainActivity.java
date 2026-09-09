@@ -24,7 +24,6 @@ import android.text.TextUtils;
 import android.view.Gravity;
 import android.view.View;
 import android.view.WindowManager;
-import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.ScrollView;
@@ -77,8 +76,8 @@ public final class MainActivity extends Activity {
     /** Calibration hint: amber, not red - nothing about the pack is wrong. */
     private TextView hintView;
     /**
-     * A failure with its fix attached: an address field when no battery
-     * controller was found, a Map button when it answered in unknown codes.
+     * A failure with what to do about it: what to check when the controller at
+     * 785 did not reply, a Map button when it answered in unknown codes.
      * Shown only while the service is stopped on that failure.
      */
     private LinearLayout troubleBox;
@@ -111,6 +110,8 @@ public final class MainActivity extends Activity {
     /** The fields behind the tiles, and the captions naming the DID each is read from. */
     private final List<BmsFields.Field> tileFields = new ArrayList<>();
     private final List<TextView> tileDids = new ArrayList<>();
+    /** What tapping the hint line does right now; it carries two different offers. */
+    private Runnable hintAction;
 
     private final BroadcastReceiver updates = new BroadcastReceiver() {
         @Override
@@ -248,7 +249,10 @@ public final class MainActivity extends Activity {
         hintView.setPadding(dp(14), dp(10), dp(14), dp(10));
         hintView.setBackground(pressable(TILE, dp(8)));
         hintView.setVisibility(View.GONE);
-        hintView.setOnClickListener(v -> offerZeroFix());
+        hintView.setOnClickListener(v -> {
+            Runnable a = hintAction;
+            if (a != null) a.run();
+        });
         Ui.buttonRole(hintView);
         LinearLayout.LayoutParams hintLp = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
@@ -318,7 +322,7 @@ public final class MainActivity extends Activity {
         bmsView.setTextSize(10);
         bmsView.setTextColor(FAINT);
         bmsView.setTypeface(Typeface.MONOSPACE);
-        // A detected BMS line carries an address, a system name and a supplier.
+        // The BMS line carries the address, a system name and a supplier.
         // Unbounded and unellipsized it pushed the status text - the thing that
         // says whether the pack is being read at all - off its own row.
         bmsView.setSingleLine(true);
@@ -439,7 +443,7 @@ public final class MainActivity extends Activity {
         box.addView(value);
 
         TextView did = new TextView(this);
-        did.setText(BmsFields.effectiveDid(f, prefs));
+        did.setText(captionDid(f));
         did.setTextSize(8.5f);
         did.setTextColor(FAINT);
         did.setTypeface(Typeface.MONOSPACE);
@@ -511,7 +515,7 @@ public final class MainActivity extends Activity {
         box.addView(value);
 
         TextView did = new TextView(this);
-        did.setText(BmsFields.effectiveDid(f, prefs));
+        did.setText(captionDid(f));
         did.setTextSize(8.5f);
         did.setTextColor(FAINT);
         did.setTypeface(Typeface.MONOSPACE);
@@ -533,9 +537,19 @@ public final class MainActivity extends Activity {
      * is exactly what the grid promises never to do.
      */
     private void refreshDidCaptions() {
-        for (int i = 0; i < tileDids.size(); i++) {
-            tileDids.get(i).setText(BmsFields.effectiveDid(tileFields.get(i), prefs));
-        }
+        for (int i = 0; i < tileDids.size(); i++) refreshTileCaption(i);
+    }
+
+    /** The DID a role is read from right now. */
+    private String captionDid(BmsFields.Field f) {
+        String did = BmsFields.effectiveDid(f, prefs);
+        // Switched off on this car - some other reading needed its code.
+        return did == null ? "off" : did;
+    }
+
+    /** The caption under one tile: the DID it reads. */
+    private void refreshTileCaption(int i) {
+        set(tileDids.get(i), captionDid(tileFields.get(i)));
     }
 
     private View buildFooter(int side) {
@@ -748,6 +762,24 @@ public final class MainActivity extends Activity {
             updatingUi = false;
         }
 
+        String hint = BmsService.calibrationHint();
+        String poll = BmsService.pollReportPath();
+        if (!hint.isEmpty()) {
+            set(hintView, hint);
+            hintAction = this::offerZeroFix;
+            hintView.setVisibility(View.VISIBLE);
+        } else if (r == null && poll != null) {
+            // Nothing on the dashboard and a transcript explaining why. Offered
+            // here as well as on the trouble card, because the empty-poll exit
+            // reconnects rather than raising a card.
+            set(hintView, "Nothing decoded on the last link. Share the poll report.");
+            hintAction = () -> shareFile(poll, "Share poll report");
+            hintView.setVisibility(View.VISIBLE);
+        } else {
+            hintAction = null;
+            hintView.setVisibility(View.GONE);
+        }
+
         if (r == null) {
             clearValues();
             return;
@@ -757,6 +789,7 @@ public final class MainActivity extends Activity {
             String key = tileKeys.get(i);
             Double v = r.get(key);
             set(tileValues.get(i), v == null ? "--" : formatValue(key, v));
+            refreshTileCaption(i);
             // The weakest group's number, coloured by what the drive so far says
             // about that group - so a 77 on the tile reads as the suspect it is,
             // and a 35 as the low-charge floor it is.
@@ -797,9 +830,6 @@ public final class MainActivity extends Activity {
         alertView.setVisibility(alerting ? View.VISIBLE : View.GONE);
         if (alerting) set(alertView, reason);
 
-        String hint = BmsService.calibrationHint();
-        hintView.setVisibility(hint.isEmpty() ? View.GONE : View.VISIBLE);
-        if (!hint.isEmpty()) set(hintView, hint);
     }
 
     /** The pack map's colour for a verdict, or plain text when it has none. */
@@ -824,16 +854,19 @@ public final class MainActivity extends Activity {
             set(v, "--");
             v.setTextColor(TEXT);
         }
+        // A disconnect keeps the captions honest about which code each tile reads.
+        for (int i = 0; i < tileDids.size(); i++) refreshTileCaption(i);
         set(deltaValue, "--  mV");
         deltaValue.setTextColor(MUTED);
         deltaBar.setBackgroundColor(MUTED);
         deltaSub.setVisibility(View.GONE);
         alertView.setVisibility(View.GONE);
-        hintView.setVisibility(View.GONE);
+        // NOT the hint line: with no reading at all it may be the only thing on
+        // screen with something to say - refresh() has just decided whether it
+        // carries an offer, and clearing it here would hide the poll report at
+        // exactly the moment it is the whole story.
         statusStrip.setVisibility(View.GONE);
     }
-
-
 
     private void toggleService() {
         // A double-tap used to read as connect-then-stop, which looks exactly
@@ -931,53 +964,11 @@ public final class MainActivity extends Activity {
         text.setLineSpacing(0, 1.25f);
         troubleBox.addView(text);
         if (t == BmsService.Trouble.NO_BMS) {
-            String extras = BmsService.discoveredEcus();
-            text.setText("No battery controller answered at any address this app knows. "
-                    + (extras.isEmpty() ? ""
-                        : "ECUs did answer at: " + extras + " - one of them may be it. ")
-                    + "If you know this car's address, enter it - three hex digits "
-                    + "like 785, or the eight of a 29-bit id like 18DA96F1.");
-            final EditText addr = new EditText(this);
-            addr.setHint("e.g. 785");
-            addr.setTextColor(TEXT);
-            addr.setHintTextColor(MUTED);
-            troubleBox.addView(addr);
-            TextView go = flatButton("Try this address", OK, v -> {
-                String id = addr.getText().toString().trim();
-                if (!CommandGuard.isRequestId(id) && !CommandGuard.isExtendedRequestId(id)) {
-                    Toast.makeText(this, "Three hex digits up to 7F7 like 785, "
-                            + "or eight like 18DA96F1", Toast.LENGTH_SHORT).show();
-                    return;
-                }
-                prefs.setBmsRequestId(id, true);
-                prefs.setBmsProtocol(id.length() == 8 ? "ATTP7" : "");
-                startMonitoring();
-            });
-            troubleBox.addView(go, new LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT, dp(44)));
-            // What the car actually said, as a file - so an owner of an
-            // unrecognised model can send facts instead of guesses.
-            final String report = BmsService.detectReportPath();
-            if (report != null) {
-                TextView share = flatButton("Share detection report", OK, v -> {
-                    android.net.Uri uri = FileSharing.uriFor(this,
-                            new java.io.File(report));
-                    if (uri == null) {
-                        Toast.makeText(this, "Report file is gone",
-                                Toast.LENGTH_SHORT).show();
-                        return;
-                    }
-                    Intent send = new Intent(Intent.ACTION_SEND);
-                    send.setType("text/plain");
-                    send.putExtra(Intent.EXTRA_STREAM, uri);
-                    send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
-                    startActivity(Intent.createChooser(send, "Share detection report"));
-                });
-                LinearLayout.LayoutParams sl = new LinearLayout.LayoutParams(
-                        LinearLayout.LayoutParams.MATCH_PARENT, dp(44));
-                sl.setMargins(0, dp(6), 0, 0);
-                troubleBox.addView(share, sl);
-            }
+            text.setText("No reply from the battery controller at " + BmsFields.BMS_REQUEST
+                    + ". Is the car switched on, with the adapter in the OBD port? "
+                    + "This app reads the Tata EVs whose battery controller, per "
+                    + "Tata's own diagnostic tool, answers at " + BmsFields.BMS_REQUEST
+                    + ": Nexon EV, Tiago.ev, Punch.ev, Curvv.ev and Tigor EV.");
         } else {
             text.setText("This car's battery controller answers, but not with the codes this "
                     + "app knows. Mapping it reads every code the controller serves and "
@@ -989,7 +980,34 @@ public final class MainActivity extends Activity {
             lp.setMargins(0, dp(10), 0, 0);
             troubleBox.addView(go, lp);
         }
+        // What was asked and what came back - for a controller that would not
+        // answer at all, or would not answer in known codes; no screenshot can
+        // show either. Outside the if/else on purpose: the no-reply card used to
+        // be the one failure that offered no evidence.
+        final String poll = BmsService.pollReportPath();
+        if (poll != null) {
+            TextView sharePoll = flatButton("Share poll report", OK,
+                    v -> shareFile(poll, "Share poll report"));
+            LinearLayout.LayoutParams pl = new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, dp(44));
+            pl.setMargins(0, dp(6), 0, 0);
+            troubleBox.addView(sharePoll, pl);
+        }
         troubleBox.setVisibility(View.VISIBLE);
+    }
+
+    /** Send one of the shareable reports, or say plainly that it is gone. */
+    private void shareFile(String path, String title) {
+        android.net.Uri uri = FileSharing.uriFor(this, new java.io.File(path));
+        if (uri == null) {
+            Toast.makeText(this, "Report file is gone", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        Intent send = new Intent(Intent.ACTION_SEND);
+        send.setType("text/plain");
+        send.putExtra(Intent.EXTRA_STREAM, uri);
+        send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        startActivity(Intent.createChooser(send, title));
     }
 
     /** Grey out and detach anything that must not be touched mid-connect. */

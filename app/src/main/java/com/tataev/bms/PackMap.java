@@ -65,6 +65,31 @@ final class PackMap {
     /** Rest minima required before a group can be BALANCE. */
     static final int BALANCE_MIN_SAMPLES = 20;
 
+    /** Moments kept per group for the tap readout - the newest few, not a log. */
+    static final int HISTORY_KEEP = 4;
+
+    /** One moment a group was the pack's weakest or strongest. */
+    static final class Moment {
+        /** Reading clock (epoch ms); 0 when the sample carried no clock. */
+        final long atMs;
+        /** The group's own voltage, mV. */
+        final int mv;
+        /** Its offset from the pack's average group at that moment, mV (rounded). */
+        final int deltaMv;
+        /** Pack current, A, positive discharging. */
+        final double amps;
+        /** True when it was the minimum, false when the maximum. */
+        final boolean asMin;
+
+        Moment(long atMs, int mv, int deltaMv, double amps, boolean asMin) {
+            this.atMs = atMs;
+            this.mv = mv;
+            this.deltaMv = deltaMv;
+            this.amps = amps;
+            this.asMin = asMin;
+        }
+    }
+
     /** What one group's measurements add up to. */
     static final class Group {
         int minCount;          // times it held the minimum
@@ -76,6 +101,31 @@ final class PackMap {
         int n;
         double sx, sy, sxx, sxy;
         double loI = Double.MAX_VALUE, hiI = -Double.MAX_VALUE;
+        // The last HISTORY_KEEP moments, as a ring: recent[head] is the newest.
+        final Moment[] recent = new Moment[HISTORY_KEEP];
+        int head = -1;
+        int recentN;
+        // Offsets at rest (|I| < REST_AMPS) and under load (I >= WATCH_AMPS), kept
+        // SEPARATELY for moments as the minimum and as the maximum: a group that
+        // swings both ways is the resistive signature this map exists to find,
+        // and one mixed-sign mean would average it into "mildly low".
+        int restMinMoments, restMaxMoments, loadMinMoments, loadMaxMoments;
+        double restMinSum, restMaxSum, loadMinSum, loadMaxSum;
+
+        void remember(Moment mo) {
+            head = (head + 1) % HISTORY_KEEP;
+            recent[head] = mo;
+            if (recentN < HISTORY_KEEP) recentN++;
+        }
+
+        /** Newest first. */
+        List<Moment> history() {
+            List<Moment> out = new ArrayList<>(recentN);
+            for (int i = 0; i < recentN; i++) {
+                out.add(recent[(head - i + HISTORY_KEEP) % HISTORY_KEEP]);
+            }
+            return out;
+        }
 
         boolean seen() {
             return minCount > 0 || maxCount > 0;
@@ -409,7 +459,7 @@ final class PackMap {
             }
         }
         Double soc = r.get("soc_pct");
-        boolean counted = add(packV, minMv, maxMv,
+        boolean counted = add(r.timestampMs, packV, minMv, maxMv,
                 (int) Math.round(minIx), (int) Math.round(maxIx), amps);
         if (counted && soc != null && soc >= 0 && soc <= 100) {
             lowestSoc = Double.isNaN(lowestSoc) ? soc : Math.min(lowestSoc, soc);
@@ -421,9 +471,16 @@ final class PackMap {
         }
     }
 
+    /** As {@link #add(long, double, double, double, int, int, double)} with no clock. */
+    synchronized boolean add(double packV, double minMv, double maxMv,
+                             int minIdx, int maxIdx, double amps) {
+        return add(0L, packV, minMv, maxMv, minIdx, maxIdx, amps);
+    }
+
     /**
      * Feed one sample.
      *
+     * @param atMs   the reading's clock, epoch ms; 0 when unknown
      * @param packV pack volts
      * @param minMv lowest group voltage, mV
      * @param maxMv highest group voltage, mV
@@ -432,7 +489,7 @@ final class PackMap {
      * @param amps   pack current, positive discharging
      * @return whether the sample was counted
      */
-    synchronized boolean add(double packV, double minMv, double maxMv,
+    synchronized boolean add(long atMs, double packV, double minMv, double maxMv,
                              int minIdx, int maxIdx, double amps) {
         // 250, not MAX_GROUPS: 0xFE/0xFF are "signal not available" sentinels on
         // many ECUs, and one such glitch latching into highestIndex would blow
@@ -464,7 +521,7 @@ final class PackMap {
         // Every group sags together under load; that common motion says nothing
         // about which group is which, so measure each against the pack average.
         double avgMv = packV * 1000.0 / baselineSeries();
-        record(groups[minIdx], amps, minMv - avgMv);
+        record(groups[minIdx], atMs, minMv, amps, minMv - avgMv, true);
         groups[minIdx].minCount++;
         // WHEN a group holds the minimum separates low charge from resistance:
         // a low-charge group is lowest at rest, a resistive one under load.
@@ -482,7 +539,7 @@ final class PackMap {
         // been at both extremes, which is the single thing this class exists to
         // prevent.
         if (maxIdx != minIdx) {
-            record(groups[maxIdx], amps, maxMv - avgMv);
+            record(groups[maxIdx], atMs, maxMv, amps, maxMv - avgMv, false);
             groups[maxIdx].maxCount++;
         }
 
@@ -516,7 +573,8 @@ final class PackMap {
         return seriesCount();
     }
 
-    private static void record(Group g, double amps, double deviationMv) {
+    private static void record(Group g, long atMs, double mv, double amps,
+                               double deviationMv, boolean asMin) {
         g.n++;
         g.sx += amps;
         g.sy += deviationMv;
@@ -524,6 +582,15 @@ final class PackMap {
         g.sxy += amps * deviationMv;
         g.loI = Math.min(g.loI, amps);
         g.hiI = Math.max(g.hiI, amps);
+        g.remember(new Moment(atMs, (int) Math.round(mv),
+                (int) Math.round(deviationMv), amps, asMin));
+        if (Math.abs(amps) < REST_AMPS) {
+            if (asMin) { g.restMinMoments++; g.restMinSum += deviationMv; }
+            else       { g.restMaxMoments++; g.restMaxSum += deviationMv; }
+        } else if (amps >= WATCH_AMPS) {
+            if (asMin) { g.loadMinMoments++; g.loadMinSum += deviationMv; }
+            else       { g.loadMaxMoments++; g.loadMaxSum += deviationMv; }
+        }
     }
 
     /**
@@ -564,6 +631,12 @@ final class PackMap {
         final State state;
         /** Share of rest / high-load samples where this group held the minimum. */
         final int restMinPct, loadMinPct;
+        /** Newest first; at most HISTORY_KEEP. Empty for a group never named. */
+        final List<Moment> recent;
+        /** Moments at rest / under load, split by which extreme the group was. */
+        final int restMinMoments, restMaxMoments, loadMinMoments, loadMaxMoments;
+        /** Mean offset over each of those four sets (0 when the set is empty). */
+        final double restMinAvgMv, restMaxAvgMv, loadMinAvgMv, loadMaxAvgMv;
 
         Snapshot(int index, Group g, State state, int restMinPct, int loadMinPct,
                  double groupMilliOhm) {
@@ -578,6 +651,15 @@ final class PackMap {
             this.state = state;
             this.restMinPct = restMinPct;
             this.loadMinPct = loadMinPct;
+            this.recent = g.history();
+            this.restMinMoments = g.restMinMoments;
+            this.restMaxMoments = g.restMaxMoments;
+            this.loadMinMoments = g.loadMinMoments;
+            this.loadMaxMoments = g.loadMaxMoments;
+            this.restMinAvgMv = g.restMinMoments == 0 ? 0 : g.restMinSum / g.restMinMoments;
+            this.restMaxAvgMv = g.restMaxMoments == 0 ? 0 : g.restMaxSum / g.restMaxMoments;
+            this.loadMinAvgMv = g.loadMinMoments == 0 ? 0 : g.loadMinSum / g.loadMinMoments;
+            this.loadMaxAvgMv = g.loadMaxMoments == 0 ? 0 : g.loadMaxSum / g.loadMaxMoments;
         }
     }
 

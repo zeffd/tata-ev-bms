@@ -16,7 +16,6 @@ final class Prefs {
     static final String KEY_MIN_CELL_LIMIT = "min_cell_limit_mv";
     static final String KEY_CURRENT_SCALE = "current_scale";
     static final String KEY_CURRENT_ZERO = "current_zero_raw";
-    static final String KEY_BMS_REQUEST = "bms_request_id";
     static final String KEY_ADAPTER_NAME = "adapter_name";
 
     private final SharedPreferences sp;
@@ -64,13 +63,6 @@ final class Prefs {
         }
         if (Math.abs(currentScale() - DEFAULT_SCALE) > 1e-6f || currentZero() != DEFAULT_ZERO) {
             d.append(d.length() > 0 ? ", " : "").append("current calibration");
-        }
-        if (bmsRequestIdIsUserEntered()) {
-            d.append(d.length() > 0 ? ", " : "").append("a typed battery controller address");
-        }
-        if (!presetName().isEmpty()) {
-            d.append(d.length() > 0 ? ", " : "").append("the ").append(presetName())
-             .append(" battery map");
         }
         return d.toString();
     }
@@ -238,44 +230,6 @@ final class Prefs {
         return v >= lo && v <= hi;
     }
 
-    /** Empty means "auto-detect on connect". */
-    String bmsRequestId() {
-        return sp.getString(pfx() + KEY_BMS_REQUEST, "");
-    }
-
-    /**
-     * @param userEntered true when a person typed it. A user-entered address is
-     *                    never auto-cleared: silently deleting what someone
-     *                    deliberately configured leaves them with no way to pin
-     *                    an ECU the auto-detector cannot recognise.
-     */
-    void setBmsRequestId(String id, boolean userEntered) {
-        sp.edit()
-          .putString(pfx() + KEY_BMS_REQUEST,
-                  id == null ? "" : id.trim().toUpperCase(Locale.ROOT))
-          .putBoolean(pfx() + KEY_BMS_REQUEST + "_user", userEntered)
-          .putString(pfx() + "bms_protocol",
-                  id == null || id.trim().isEmpty() ? "" : sp.getString(pfx() + "bms_protocol", ""))
-          .apply();
-    }
-
-    void setBmsRequestId(String id) {
-        setBmsRequestId(id, false);
-    }
-
-    boolean bmsRequestIdIsUserEntered() {
-        return sp.getBoolean(pfx() + KEY_BMS_REQUEST + "_user", false);
-    }
-
-    /** The ATSP command the saved address answered on; "" = the default, ATSP6. */
-    String bmsProtocol() {
-        return sp.getString(pfx() + "bms_protocol", "");
-    }
-
-    void setBmsProtocol(String atsp) {
-        sp.edit().putString(pfx() + "bms_protocol", atsp == null ? "" : atsp.trim()).apply();
-    }
-
     String adapterName() {
         return sp.getString(KEY_ADAPTER_NAME, "");
     }
@@ -307,25 +261,16 @@ final class Prefs {
                 encoded == null ? "" : encoded.trim()).apply();
     }
 
-    /** The battery-map preset applied to this car, or "". Shown, never decided from. */
-    String presetName() {
-        return sp.getString(pfx() + "preset_name", "");
-    }
-
-    void setPresetName(String name) {
-        sp.edit().putString(pfx() + "preset_name", name == null ? "" : name).apply();
-    }
-
     /**
-     * Was anything on this profile's battery map set by hand or by an earlier
-     * preset? Any DID override, any scale override, or a preset name.
+     * Was anything on this profile's battery map set by hand? Any DID override
+     * or any scale override.
      *
      * The scan itself lives in {@link ProfileMatch#anyMapping} - pure, so the
-     * self-test can pin the prefix arithmetic this half of the preset gate
-     * depends on. All this method contributes is the Android state.
+     * self-test can pin the prefix arithmetic this question depends on. All this
+     * method contributes is the Android state.
      */
     boolean hasAnyOverride() {
-        return ProfileMatch.anyMapping(sp.getAll(), pfx(), presetName());
+        return ProfileMatch.anyMapping(sp.getAll(), pfx());
     }
 
     void clearAllDidOverrides() {
@@ -337,15 +282,16 @@ final class Prefs {
         for (String k : sp.getAll().keySet()) {
             if (k.startsWith(p) || k.startsWith(s)) e.remove(k);
         }
+        // legacy key from a removed feature; still cleared so old profiles come clean
         e.remove(pfx() + "preset_name");
         e.apply();
     }
 
     // ------------------------------------------------------- vehicle profiles
     //
-    // A profile is the set of PER-VEHICLE settings: BMS address, DID overrides,
-    // current calibration, alert thresholds, and what the pack map has learned.
-    // Everything else (logging, poll rate, adapter, CSV fields) stays global.
+    // A profile is the set of PER-VEHICLE settings: DID overrides, current
+    // calibration, alert thresholds, and what the pack map has learned.
+    // Everything else (logging, auto-connect, the adapter name) stays global.
     //
     // Profile 1 keeps the LEGACY un-prefixed settings keys, so an existing
     // install's settings simply ARE profile 1 - there is no migration step to

@@ -62,8 +62,10 @@ public final class SelfTest {
         alerting();
         adapterReject();
         adapterCaps();
+        probeClassification();
         scanReportHeader();
         packMap();
+        groupMoments();
         zeroBasedPack();
         deviationBaseline();
         scanTruncationReported();
@@ -74,11 +76,11 @@ public final class SelfTest {
         seededPackMap();
         scanLinkLoss();
         classification();
-        discovery();
-        extendedAddressing();
-        protocolLadder();
         dialects();
         scaleAwareScan();
+        pollReport();
+        idReads();
+        disabledRoles();
         seriesCountStability();
         findings();
         socContext();
@@ -226,7 +228,7 @@ public final class SelfTest {
         check("3480 allowed continuous regen 26.5 kW", dec("3480", "0109"), 26.5);
         check("3481 negative busbar 0.1 V", dec("3481", "0001"), 0.1);
         check("3482 positive busbar 345.8 V", dec("3482", "0D82"), 345.8);
-        check("3484 MCU DC link 346 V", dec("3484", "015A"), 346.0);
+        check("3484 VCU busbar 346 V", dec("3484", "015A"), 346.0);
         check("3404 relay byte raw", dec("3404", "06"), 6.0);
         check("340A hottest probe number", dec("340A", "05"), 5.0);
         check("340C coldest probe number", dec("340C", "02"), 2.0);
@@ -323,7 +325,7 @@ public final class SelfTest {
             try {
                 UdsCodec.decode22(bad, "78D");
                 splitAsAppDoes(bad, "78D", W);
-                UdsCodec.reassemble(bad, 3);
+                UdsCodec.reassemble(bad);
             } catch (RuntimeException e) {
                 crashes++;
                 System.out.println("    CRASH on " + bad + ": " + e);
@@ -409,7 +411,7 @@ public final class SelfTest {
      */
     private static Map<String, byte[]> splitAsAppDoes(String text, String id,
                                                       UdsCodec.WidthLookup widths) {
-        return UdsCodec.splitBatch(UdsCodec.reassemble(text, 3).get(id), widths);
+        return UdsCodec.splitBatch(UdsCodec.reassemble(text).get(id), widths);
     }
 
     private static void batching() {
@@ -584,19 +586,14 @@ public final class SelfTest {
         check("ATSH with wrong-length id refused",
                 CommandGuard.isAllowed("ATSH 7850"), false);
 
-        // The protocol ladder: 29-bit and 250 kbaud CAN, each an ISO 15765-4
-        // flavour. Auto-search (ATSP0/ATTP0) is deliberately not on the list -
-        // the ladder chooses, and the record of what was tried must be exact.
-        //
-        // The PROBING rungs use ATTP ("try protocol"), not ATSP: ATSP writes the
-        // adapter's EEPROM, so a probe would leave the dongle defaulting to
-        // 250 kbaud for every other tool the owner ever plugs in. Only rung 1's
-        // ATSP6 - the unchanged default Nexon path - may persist.
-        check("ATTP7 (29-bit 500k) allowed", CommandGuard.isAllowed("ATTP7"), true);
-        check("ATTP8 (11-bit 250k) allowed", CommandGuard.isAllowed("ATTP8"), true);
-        check("ATTP9 (29-bit 250k) allowed", CommandGuard.isAllowed("ATTP9"), true);
-        check("ATSP6 (the default, persisted on purpose) allowed",
-                CommandGuard.isAllowed("ATSP6"), true);
+        // One wire only: ISO 15765-4, CAN 11-bit, 500 kbaud. ATSP6 is the sole
+        // protocol select left, and it is the adapter's own sensible default, so
+        // persisting it to EEPROM changes nothing for the next tool. Every "try
+        // protocol" form went with the ladder, and auto-search was never allowed.
+        check("ATSP6 (the one wire) allowed", CommandGuard.isAllowed("ATSP6"), true);
+        check("ATTP7 (29-bit 500k) refused", CommandGuard.isAllowed("ATTP7"), false);
+        check("ATTP8 (11-bit 250k) refused", CommandGuard.isAllowed("ATTP8"), false);
+        check("ATTP9 (29-bit 250k) refused", CommandGuard.isAllowed("ATTP9"), false);
         check("persisting ATSP7 refused", CommandGuard.isAllowed("ATSP7"), false);
         check("persisting ATSP8 refused", CommandGuard.isAllowed("ATSP8"), false);
         check("persisting ATSP9 refused", CommandGuard.isAllowed("ATSP9"), false);
@@ -606,33 +603,27 @@ public final class SelfTest {
         check("ATTPA refused", CommandGuard.isAllowed("ATTPA"), false);
         // "Hear everyone" on a clone that refuses ATCRA: the mask, not the filter.
         check("ATCM000 (11-bit open mask) allowed", CommandGuard.isAllowed("ATCM000"), true);
-        check("ATCM00000000 (29-bit open mask) allowed",
-                CommandGuard.isAllowed("ATCM00000000"), true);
-        check("29-bit ATSH allowed", CommandGuard.isAllowed("ATSH18DA96F1"), true);
-        check("29-bit ATSH with a space allowed", CommandGuard.isAllowed("ATSH 1BDA96F1"), true);
-        check("29-bit ATCRA allowed", CommandGuard.isAllowed("ATCRA18DAF196"), true);
-        check("29-bit ATFCSH allowed", CommandGuard.isAllowed("ATFCSH1BDAF3F1"), true);
+        // Every 29-bit form goes with the 29-bit addressing: an id is three hex
+        // digits now, so an eight-digit one is not a CAN id at all.
+        check("29-bit open mask refused", CommandGuard.isAllowed("ATCM00000000"), false);
+        check("29-bit ATSH refused", CommandGuard.isAllowed("ATSH18DA96F1"), false);
+        check("29-bit ATSH with a space refused", CommandGuard.isAllowed("ATSH 1BDA96F1"), false);
+        check("29-bit ATCRA refused", CommandGuard.isAllowed("ATCRA18DAF196"), false);
+        check("29-bit ATFCSH refused", CommandGuard.isAllowed("ATFCSH1BDAF3F1"), false);
         check("seven-digit id refused", CommandGuard.isAllowed("ATSH18DA96F"), false);
         check("nine-digit id refused", CommandGuard.isAllowed("ATSH18DA96F10"), false);
-        check("29-bit id with non-hex refused", CommandGuard.isAllowed("ATSH18DA96G1"), false);
-        check("8 hex digits is an extended request id",
-                CommandGuard.isExtendedRequestId("18DA96F1"), true);
-        check("3 digits is not", CommandGuard.isExtendedRequestId("785"), false);
-        check("null is not", CommandGuard.isExtendedRequestId(null), false);
-        // The 29-bit header the way every ELM327 sets it: priority byte + 24 bits.
-        check("ATCP priority byte allowed", CommandGuard.isAllowed("ATCP18"), true);
-        check("Tata's 1B priority allowed", CommandGuard.isAllowed("ATCP 1B"), true);
+        // The priority byte only ever existed to carry a 29-bit header.
+        check("ATCP priority byte refused", CommandGuard.isAllowed("ATCP18"), false);
         check("bare ATCP refused", CommandGuard.isAllowed("ATCP"), false);
-        check("one-digit ATCP refused", CommandGuard.isAllowed("ATCP1"), false);
-        check("non-hex ATCP refused", CommandGuard.isAllowed("ATCPG1"), false);
-        check("six-digit ATSH (24-bit header) allowed", CommandGuard.isAllowed("ATSHDA96F1"), true);
-        check("six digits are for ATSH only", CommandGuard.isAllowed("ATCRADA96F1"), false);
+        // The 24-bit ATSH form went with ATCP; three digits or nothing.
+        check("six-digit ATSH refused", CommandGuard.isAllowed("ATSHDA96F1"), false);
+        check("six-digit ATCRA refused", CommandGuard.isAllowed("ATCRADA96F1"), false);
         // The pre-v1.3 receive filter pair, for a clone that refuses ATCRA and
         // then keeps its factory 7E8-7EF window. Adapter-local, read-only.
         check("ATCF with an 11-bit id allowed", CommandGuard.isAllowed("ATCF78D"), true);
         check("ATCM with an 11-bit mask allowed", CommandGuard.isAllowed("ATCM7FF"), true);
-        check("ATCF with a 29-bit id allowed", CommandGuard.isAllowed("ATCF18DAF196"), true);
-        check("ATCM with a 29-bit mask allowed", CommandGuard.isAllowed("ATCM1FFFFFFF"), true);
+        check("ATCF with a 29-bit id refused", CommandGuard.isAllowed("ATCF18DAF196"), false);
+        check("ATCM with a 29-bit mask refused", CommandGuard.isAllowed("ATCM1FFFFFFF"), false);
         check("bare ATCF refused", CommandGuard.isAllowed("ATCF"), false);
         check("ATCM with a wrong-length mask refused", CommandGuard.isAllowed("ATCM7FFF"), false);
 
@@ -648,9 +639,8 @@ public final class SelfTest {
         // allowlist family, including the ones that carry a legal space.
         int refused = 0;
         for (String c : new String[]{"ATZ", "ATE0", "ATL0", "ATS0", "ATH1", "ATCAF1",
-                "ATSP6", "ATAT1", "ATTP7", "ATCRA", "ATFCSD300000", "ATFCSM1",
-                "ATSH 785", "ATSH18DA96F1", "ATSHDA96F1", "ATCRA78D", "ATFCSH785",
-                "ATCP 1B", "ATCM000", "ATCM7FF", "ATCF78D",
+                "ATSP6", "ATAT1", "ATCRA", "ATFCSD300000", "ATFCSM1",
+                "ATSH 785", "ATCRA78D", "ATFCSH785", "ATCM000", "ATCM7FF", "ATCF78D",
                 "22F190", "22F1903402", "1001", "1003", "3E00"}) {
             if (!CommandGuard.isAllowed(c)) {
                 refused++;
@@ -990,6 +980,95 @@ public final class SelfTest {
         }
     }
 
+    /** Tapping a group: the last four moments it was an extreme, and its rest/load offsets. */
+    private static void groupMoments() {
+        System.out.println("\n=== group history on tap ===");
+        PackMap m = new PackMap();
+        m.seed(104);
+        // Pack 346.0 V over 104 groups: average 3326.9 mV. Six samples; group 15
+        // is the minimum in all six, group 77 the maximum in the first two only.
+        long t0 = 1_700_000_000_000L;
+        for (int i = 0; i < 6; i++) {
+            Reading r = new Reading(t0 + i * 1000L);
+            r.values.put("pack_v", 346.0);
+            r.values.put("cell_min_mv", 3290.0 - i);          // 3290, 3289, ... 3285
+            r.values.put("cell_max_mv", 3360.0);
+            r.values.put("cell_min_idx", 15.0);
+            r.values.put("cell_max_idx", i < 2 ? 77.0 : 40.0);
+            r.values.put("current_a", i < 3 ? 2.0 : 60.0);    // 3 at rest, 3 under load
+            r.computeDerived();
+            m.add(r);
+        }
+        PackMap.Snapshot g = m.snapshot(15);
+        check("ring keeps four", g.recent.size(), 4);
+        check("newest first", g.recent.get(0).atMs, t0 + 5000L);
+        check("...oldest kept is the third sample", g.recent.get(3).atMs, t0 + 2000L);
+        check("moment carries the voltage", g.recent.get(0).mv, 3285);
+        check("moment is flagged as the minimum", g.recent.get(0).asMin, true);
+        check("moment carries the current", g.recent.get(0).amps, 60.0);
+        // 3285 - 3326.9 = -41.9 -> -42 mV
+        check("offset is against the pack average", g.recent.get(0).deltaMv, -42);
+        check("rest moments as min", g.restMinMoments, 3);
+        check("rest moments as max", g.restMaxMoments, 0);
+        check("load moments as min", g.loadMinMoments, 3);
+        check("load moments as max", g.loadMaxMoments, 0);
+        // rest: 3290,3289,3288 -> mean 3289 - 3326.9 = -37.9
+        check("rest average offset as min", Math.round(g.restMinAvgMv), -38L);
+        // load: 3287,3286,3285 -> mean 3286 - 3326.9 = -40.9
+        check("load average offset as min", Math.round(g.loadMinAvgMv), -41L);
+        PackMap.Snapshot mx = m.snapshot(77);
+        check("a maximum is recorded too", mx.recent.size(), 2);
+        check("...flagged as the maximum", mx.recent.get(0).asMin, false);
+        check("...with a positive offset", mx.recent.get(0).deltaMv > 0, true);
+        check("unnamed group has no history", m.snapshot(50).recent.size(), 0);
+        check("unnamed group has no rest samples", m.snapshot(50).restMinMoments, 0);
+        // The six-argument add (no clock) records a moment with atMs 0.
+        PackMap noClock = new PackMap();
+        noClock.add(346.0, 3300, 3350, 3, 9, 1.0);
+        check("no clock: moment stored with atMs 0", noClock.snapshot(3).recent.get(0).atMs, 0L);
+        // Same group at both extremes (flat pack) records ONE moment, as the minimum.
+        PackMap flat = new PackMap();
+        flat.add(346.0, 3330, 3330, 7, 7, 0.0);
+        check("flat pack: one moment for the shared extreme", flat.snapshot(7).recent.size(), 1);
+        check("...recorded as the minimum", flat.snapshot(7).recent.get(0).asMin, true);
+
+        java.util.TimeZone utc = java.util.TimeZone.getTimeZone("UTC");
+        String text = GroupMoments.render(m.snapshot(15), utc);
+        // t0 = 1_700_000_000_000 ms = 2023-11-14 22:13:20 UTC; sample 5 is +5 s.
+        check("header counts every moment", text.startsWith(
+                "Last 4 moments as weakest or strongest (6 in total)\n"), true);
+        check("newest line first, aligned columns",
+                text.contains("22:13:25  3.285 V  -42 mV   60 A  min\n"), true);
+        check("oldest kept line", text.contains("22:13:22  3.288 V  -39 mV    2 A  min\n"), true);
+        check("rest line", text.contains("at rest:    -38 mV over 3 as min\n"), true);
+        check("load line", text.endsWith("under load: -41 mV over 3 as min"), true);
+        String two = GroupMoments.render(m.snapshot(77), utc);
+        check("fewer than four: header says all",
+                two.startsWith("All 2 moments as weakest or strongest\n"), true);
+        // Group 77 was the maximum twice, both at rest: 3360 - 3326.9 = +33.
+        check("a max-only group says so", two.contains("at rest:    +33 mV over 2 as max"), true);
+        check("no load moments: no load line", two.contains("under load"), false);
+        // A group that is the minimum at rest AND the maximum at rest prints both,
+        // never a mixed-sign mean that hides the swing.
+        PackMap both = new PackMap();
+        both.seed(104);
+        both.add(346.0, 3290, 3360, 5, 6, 1.0);   // 5 is min
+        both.add(346.0, 3290, 3360, 6, 5, 1.0);   // 5 is max
+        String b = GroupMoments.render(both.snapshot(5), utc);
+        check("both extremes at rest, split",
+                b.contains("at rest:    -37 mV over 1 as min, +33 mV over 1 as max"), true);
+        // -0.4 A is a parked pack, and must not print as "-0 A".
+        PackMap park = new PackMap();
+        park.seed(104);
+        park.add(346.0, 3300, 3350, 3, 9, -0.4);
+        check("tiny negative current prints as 0",
+                GroupMoments.render(park.snapshot(3), utc).contains("   0 A  min"), true);
+        check("unnamed group renders nothing", GroupMoments.render(m.snapshot(50), utc), "");
+        check("null renders nothing", GroupMoments.render(null, utc), "");
+        String nc = GroupMoments.render(noClock.snapshot(3), utc);
+        check("no clock prints dashes", nc.contains("--:--:--  3.300 V"), true);
+    }
+
     // ------------------------------------------------------- vehicle profiles
 
     private static void profileMatch() {
@@ -1025,62 +1104,58 @@ public final class SelfTest {
         check("different car -> create",
                 ProfileMatch.decide("MAT2", "MAT1", false), ProfileMatch.Action.CREATE);
 
-        check("fingerprint from address+supplier",
-                ProfileMatch.fingerprint("785", "GOTION_BMS"), "785|GOTION_BMS");
+        // A VIN-less car is keyed by its controller's own serial number. The
+        // address|supplier form is only the fallback: the address is a constant
+        // now, so on its own it named the SUPPLIER, and two VIN-less Tatas that
+        // both answer GOTION_BMS shared one profile - one calibration, one set
+        // of thresholds, one pack map for two cars.
+        check("serial number keys a VIN-less car",
+                ProfileMatch.fingerprint("2308305832", "GOTION_BMS"), "SN|2308305832");
+        check("the serial stands alone - the supplier adds nothing to it",
+                ProfileMatch.fingerprint("2308305832", ""), "SN|2308305832");
+        check("a serial is folded, so case cannot split one car in two",
+                ProfileMatch.fingerprint("ab12cd", "GOTION_BMS"), "SN|AB12CD");
+        check("an all-F serial is 'not programmed', so the supplier form is used",
+                ProfileMatch.fingerprint("FFFFFFFFFFFFFFFFFFFFFFFF", "GOTION_BMS"),
+                "785|GOTION_BMS");
+        check("an all-zero serial is unprogrammed too",
+                ProfileMatch.fingerprint("000000000000", "GOTION_BMS"), "785|GOTION_BMS");
+        check("no serial: the legacy supplier form, so old profiles still match",
+                ProfileMatch.fingerprint("", "GOTION_BMS"), "785|GOTION_BMS");
+        // Half an identity must still be NONE. Without a serial or a supplier the
+        // only thing left is the address, which every Tata shares, so a flaky
+        // pair of reads would otherwise mint one junk profile for all of them.
+        check("nothing to key on", ProfileMatch.fingerprint(null, ""), "");
         check("no identity at all -> empty",
                 ProfileMatch.fingerprint("", null), "");
-        // Half an identity must be NONE: the address is always known locally, so
-        // a failed supplier read would otherwise mint the pseudo-id "785|" and a
-        // flaky connect would create a junk profile per hiccup.
-        check("half an identity (no supplier) is none",
-                ProfileMatch.fingerprint("785", ""), "");
-        check("half an identity (no address) is none",
-                ProfileMatch.fingerprint(null, "GOTION_BMS"), "");
 
-        // May a catalog preset be written into the ACTIVE profile? Fourteen DID
-        // overrides plus a full scale set land here, so both halves matter.
-        check("resolved profile, nothing mapped -> preset may be written",
-                ProfileMatch.mayApplyPreset(true, false), true);
-        // The connect that read no VIN while the active profile IS VIN-keyed
-        // stayed put attaching nothing: this may not be that profile's car, and
-        // a $30xx preset would turn a Nexon profile into a TacoGotion one.
-        check("unconfirmed profile -> no preset",
-                ProfileMatch.mayApplyPreset(false, false), false);
-        // A Scan-applied override is the owner's decision, not the catalog's.
-        check("mapped by hand -> no preset",
-                ProfileMatch.mayApplyPreset(true, true), false);
-        check("unconfirmed AND mapped -> no preset",
-                ProfileMatch.mayApplyPreset(false, true), false);
-
-        // The OTHER half of that gate: "is anything mapped on this profile?".
-        // Prefs.hasAnyOverride needs SharedPreferences, so the prefix scan - the
-        // place this class of bug actually lives - used to be unreachable from
-        // here. anyMapping is that scan, pure.
+        // "Is anything mapped on this profile?" - the question the Scan screen
+        // and the reset button both ask. Prefs.hasAnyOverride needs
+        // SharedPreferences, so the prefix scan - the place this class of bug
+        // actually lives - used to be unreachable from here. anyMapping is that
+        // scan, pure.
         java.util.Map<String, Object> other = new java.util.HashMap<>();
         other.put("p2_did_override_x", "3017");
         check("profile 1 does not see profile 2's override",
-                ProfileMatch.anyMapping(other, "", ""), false);
+                ProfileMatch.anyMapping(other, ""), false);
         java.util.Map<String, Object> tenth = new java.util.HashMap<>();
         tenth.put("p20_did_override_x", "3017");
         check("profile 2 does not see profile 20's override",
-                ProfileMatch.anyMapping(tenth, "p2_", ""), false);
+                ProfileMatch.anyMapping(tenth, "p2_"), false);
         // Scan writes an EMPTY scale override to mean "decode with the built-in
         // kind", which is not a mapping. Values are checked, not just keys.
         java.util.Map<String, Object> blank = new java.util.HashMap<>();
         blank.put("scale_override_pack_v", "");
         check("an empty scale override is not a mapping",
-                ProfileMatch.anyMapping(blank, "", ""), false);
+                ProfileMatch.anyMapping(blank, ""), false);
         java.util.Map<String, Object> scaled = new java.util.HashMap<>();
         scaled.put("scale_override_pack_v", "10;0;2");
         check("a real scale override is a mapping",
-                ProfileMatch.anyMapping(scaled, "", ""), true);
-        check("a preset name alone is a mapping",
-                ProfileMatch.anyMapping(new java.util.HashMap<String, Object>(),
-                        "", "TacoGotion 30xx"), true);
+                ProfileMatch.anyMapping(scaled, ""), true);
         java.util.Map<String, Object> mine = new java.util.HashMap<>();
         mine.put("p2_did_override_soc_pct", "300F");
         check("a DID override on the matching prefix is a mapping",
-                ProfileMatch.anyMapping(mine, "p2_", ""), true);
+                ProfileMatch.anyMapping(mine, "p2_"), true);
     }
 
     /** A profile-seeded map is right from the first sample and still self-corrects. */
@@ -1711,6 +1786,15 @@ public final class SelfTest {
                 PollPlan.judgeFast(false, false, true), PollPlan.Fast.SKIP);
         check("cells used to decode, silence -> empty-poll rule",
                 PollPlan.judgeFast(false, true, true), PollPlan.Fast.EMPTY);
+
+        // One ECU stayed silent on three-DID reads; the scan's single
+        // reads worked. A silent batch is not proof of a mute ECU until the
+        // single reads are silent too.
+        check("silent batch, singles answered: not mute", PollPlan.groupMute(true, 2), false);
+        check("silent batch, singles silent: mute", PollPlan.groupMute(true, 0), true);
+        check("batch answered: never mute here", PollPlan.groupMute(false, 0), false);
+        check("one silent-batch-singles-ok is a hiccup", PollPlan.dropBatching(1), false);
+        check("two is the ECU telling us", PollPlan.dropBatching(2), true);
     }
 
     /**
@@ -2019,113 +2103,13 @@ public final class SelfTest {
      * Broadcast discovery: a functional probe's reply text names every ECU on
      * the bus, and each response id maps back to a typable request id.
      */
-    private static void discovery() {
-        System.out.println("\n=== broadcast ECU discovery ===");
-        // Three ECUs answer one functional probe: a session reply, an NRC, and
-        // a TesterPresent acknowledgement - all single frames, all count.
-        String text = "7E80462F18601\n78D037F2211\n7C6027E00";
-        check("all responding ids heard", UdsCodec.respondingIds(text).size(), 3);
-        check("Tata pair maps back", UdsCodec.requestIdFor("78D"), "785");
-        check("ISO pair maps back", UdsCodec.requestIdFor("7E8"), "7E0");
-        check("below-range response rejected", UdsCodec.requestIdFor("005"), null);
-        check("junk rejected", UdsCodec.requestIdFor("XYZ"), null);
-        check("bare ATCRA (open filter) is allowed",
-                CommandGuard.isAllowed("ATCRA"), true);
-        check("ATCRA with an id still allowed",
-                CommandGuard.isAllowed("ATCRA 78D"), true);
-        check("ATMA is still refused", CommandGuard.isAllowed("ATMA"), false);
-    }
-
     /**
-     * 29-bit addressing as the ELM327 prints it with headers on: an eight-digit
-     * id where the 11-bit path has three. Physical replies swap the source and
-     * target bytes: a request to 18DA96F1 is answered on 18DAF196.
-     */
-    private static void extendedAddressing() {
-        System.out.println("\n=== 29-bit addressing ===");
-        String single = "18DAF196056234020375";
-        UdsCodec.Response r = UdsCodec.decode22(single, "18DAF196");
-        check("29-bit single frame decodes", r == null ? null : r.did, "3402");
-        check("...to the right value", r == null ? null : UdsCodec.toHex(r.data), "0375");
-        String multi = "18DAF196101B62F197424D53\n18DAF1962120202020202020\n"
-                     + "18DAF1962220202020202020\n18DAF1962320202020202020";
-        UdsCodec.Response n = UdsCodec.decode22(multi, "18DAF196", "F197");
-        check("29-bit multi-frame reassembles", n == null ? null : ascii(n.data).trim(), "BMS");
-        check("another 29-bit ECU is ignored",
-                UdsCodec.decode22(single, "18DAF1F3"), null);
-        check("request for a Gotion reply", UdsCodec.requestIdFor("18DAF196"), "18DA96F1");
-        check("request for a Tata-prefix reply", UdsCodec.requestIdFor("1BDAF1F3"), "1BDAF3F1");
-        check("11-bit still maps back", UdsCodec.requestIdFor("78D"), "785");
-        check("response for an 11-bit request", UdsCodec.responseIdFor("785"), "78D");
-        check("response for a 29-bit request", UdsCodec.responseIdFor("18DA96F1"), "18DAF196");
-        check("response for the Tata prefix", UdsCodec.responseIdFor("1BDAF3F1"), "1BDAF1F3");
-        check("odd-length id rejected", UdsCodec.responseIdFor("18DA96"), null);
-        String broadcast = "18DAF196027E00\n1BDAF1F3037F2211\n18DAF1E5027E00";
-        check("29-bit broadcast hears three", UdsCodec.respondingIds(broadcast, 8).size(), 3);
-        check("...and 3-digit parsing of the same text hears none of them as valid",
-                UdsCodec.respondingIds(broadcast, 3).contains("18DAF196"), false);
-    }
-
-    private static void protocolLadder() {
-        System.out.println("\n=== protocol ladder ===");
-        List<ProtocolLadder.Rung> rungs = ProtocolLadder.rungs();
-        check("four rungs", rungs.size(), 4);
-        check("first rung is today's behaviour", rungs.get(0).atsp, "ATSP6");
-        check("...with the 11-bit candidate list", rungs.get(0).candidates, BmsFields.BMS_CANDIDATES);
-        check("...and the 11-bit functional id", rungs.get(0).functional.get(0), "7DF");
-        check("second rung is 29-bit 500k", rungs.get(1).atsp, "ATTP7");
-        check("29-bit ids are eight digits", rungs.get(1).idLen, 8);
-        check("Gotion's catalog address is tried first",
-                rungs.get(1).candidates.get(0), "18DA96F1");
-        check("Tata's 1BDA prefix is tried too", rungs.get(1).candidates.contains("1BDA96F1"), true);
-        check("TacoGotion/Kratos address is tried", rungs.get(1).candidates.contains("1BDAF3F1"), true);
-        check("29-bit functional broadcast, both prefixes",
-                rungs.get(1).functional, Arrays.asList("18DB33F1", "1BDB33F1"));
-        check("250k rungs are short", rungs.get(2).candidates.size() <= 4
-                && rungs.get(3).candidates.size() <= 4, true);
-        boolean allLegal = true;
-        for (ProtocolLadder.Rung r : rungs) {
-            if (!CommandGuard.isAllowed(r.atsp)) allLegal = false;
-            for (String id : r.candidates) if (!CommandGuard.isAllowed("ATSH" + id)) allLegal = false;
-            for (String id : r.functional) if (!CommandGuard.isAllowed("ATSH" + id)) allLegal = false;
-            for (String id : r.candidates) {
-                if (UdsCodec.responseIdFor(id) == null) allLegal = false;
-                if (!CommandGuard.isAllowed("ATCRA" + UdsCodec.responseIdFor(id))) allLegal = false;
-            }
-        }
-        check("every rung transmits only allowed commands", allLegal, true);
-        // Only the default rung may write the adapter's EEPROM; every rung the
-        // ladder PROBES with is a try-protocol, so a dongle that has been through
-        // a failed detection still defaults to 500 kbaud for the next tool.
-        boolean probesPersist = false;
-        for (int i = 1; i < rungs.size(); i++) {
-            if (rungs.get(i).atsp.startsWith("ATSP")) probesPersist = true;
-        }
-        check("no probing rung persists to the adapter", probesPersist, false);
-        check("saved protocol wins", ProtocolLadder.atspForId("785", "ATTP8"), "ATTP8");
-        check("no saved protocol: 3 digits means ATSP6", ProtocolLadder.atspForId("785", ""), "ATSP6");
-        check("no saved protocol: 8 digits means ATTP7",
-                ProtocolLadder.atspForId("18DA96F1", null), "ATTP7");
-        check("unknown protocol falls back to the first rung",
-                ProtocolLadder.forProtocol("ATSPX").atsp, "ATSP6");
-        check("ATTP9 rung resolves", ProtocolLadder.forProtocol("ATTP9").idLen, 8);
-        // A phone that saved a rung under its old persisting name must still
-        // reopen on the right wire, not silently drop to 11-bit 500k.
-        check("a saved ATSP7 resolves to the 29-bit rung",
-                ProtocolLadder.forProtocol("ATSP7").atsp, "ATTP7");
-        check("...and atspForId sends the non-persistent form",
-                ProtocolLadder.atspForId("18DA96F1", "ATSP7"), "ATTP7");
-        check("a saved ATSP9 resolves to 29-bit 250k",
-                ProtocolLadder.forProtocol("ATSP9").atsp, "ATTP9");
-    }
-
-    /**
-     * The $30xx controllers serve the Nexon's roles at other DIDs and other
-     * scales. A per-role Scale override decodes them without new Kinds, and
-     * the three suppliers are told apart by two reply widths.
+     * A controller that serves the Nexon's roles at other scales and widths.
+     * A per-role Scale override decodes it without new Kinds; the Scan screen
+     * writes those overrides, and nothing is ever applied from a catalog.
      */
     private static void dialects() throws Exception {
-        System.out.println("\n=== second BMS dialect: presets and scale overrides ===");
+        System.out.println("\n=== other controllers: scale and width overrides ===");
         BmsFields.Scale ten = BmsFields.Scale.parse("10;0;2");
         check("TacoGotion cell volts: 325 counts x 10 mV", BmsFields.decode(BmsFields.byDid("3415"),
                 new byte[]{0x01, 0x45}, ten, 0.1, 32000), 3250.0);
@@ -2137,8 +2121,8 @@ public final class SelfTest {
                 new byte[]{0x00, 0x41}, BmsFields.Scale.parse("1;0;2"), 0.1, 32000), 65.0);
         check("wrong width decodes to nothing", BmsFields.decode(BmsFields.byDid("3402"),
                 new byte[]{0x00, 0x32}, BmsFields.Scale.parse("0.5;0;1"), 0.1, 32000), null);
-        // Current keeps its own calibration path: a preset sets zero and scale,
-        // not a Scale override, so the charger calibration still works on it.
+        // Current keeps its own calibration path: its zero and scale are
+        // calibrated, never a Scale override, so charger calibration still works.
         check("current keeps the calibration path", BmsFields.decode(BmsFields.byDid("3401"),
                 new byte[]{0x17, 0x70}, BmsFields.Scale.parse("0.1;-600;2"), 0.1, 6000), 0.0);
         check("no override, old path", BmsFields.decode(BmsFields.byDid("3402"),
@@ -2159,55 +2143,10 @@ public final class SelfTest {
         check("scaleOf reads the override", BmsFields.scaleOf(BmsFields.byDid("3415"), p).factor, 10.0);
         check("scaleOf without one is null", BmsFields.scaleOf(BmsFields.byDid("3419"), p), null);
 
-        check("2-byte SOC means TacoGotion", Presets.identify30xx(2, 1).name, "TacoGotion 30xx");
-        check("1-byte SOC, 2-byte index means Kratos", Presets.identify30xx(1, 2).name, "Kratos 30xx");
-        check("1-byte SOC, 1-byte index means CESL", Presets.identify30xx(1, 1).name, "CESL 30xx");
-        check("no SOC answer, no preset", Presets.identify30xx(0, 1), null);
-        check("three presets", Presets.all().size(), 3);
-        for (Presets.Preset pr : Presets.all()) {
-            boolean legal = true, dup = false, unscaled = false, collides = false;
-            java.util.Set<String> seen = new java.util.HashSet<>();
-            for (Map.Entry<String, String> e : pr.dids.entrySet()) {
-                if (BmsFields.byKey(e.getKey()) == null) legal = false;
-                if (!CommandGuard.isAllowed("22" + e.getValue())) legal = false;
-                if (!seen.add(e.getValue())) dup = true;
-                // Current is calibrated, not scaled; every OTHER mapped role
-                // must carry a scale, or the preset's DID is decoded with the
-                // Nexon's kind and width - a wrong number, not a blank one.
-                if (!e.getKey().equals("current_a") && !pr.scales.containsKey(e.getKey())) {
-                    unscaled = true;
-                }
-                // pollOnce keys widths and batch results by DID string, so two
-                // roles on one DID collapse into a single entry decoded two ways.
-                // applyOverrides refuses that on the scan path; a preset writes
-                // 17-23 overrides with no such check, and what keeps it safe is
-                // that no preset DID is also a BmsFields default the preset
-                // leaves in place.
-                BmsFields.Field clash = BmsFields.byDid(e.getValue());
-                if (clash != null && !pr.dids.containsKey(clash.key)) collides = true;
-            }
-            for (Map.Entry<String, String> e : pr.scales.entrySet()) {
-                if (BmsFields.Scale.parse(e.getValue()) == null) legal = false;
-                if (!pr.dids.containsKey(e.getKey())) legal = false;
-            }
-            check(pr.name + ": every mapped role but current carries a scale", unscaled, false);
-            check(pr.name + ": no DID collides with an unremapped default", collides, false);
-            check(pr.name + ": roles exist, DIDs legal, scales parse", legal, true);
-            check(pr.name + ": no two roles share a DID", dup, false);
-            check(pr.name + ": maps the six pack-map roles",
-                    pr.dids.keySet().containsAll(Arrays.asList(PackMap.REQUIRED_KEYS)), true);
-            check(pr.name + ": current is calibrated, not scaled",
-                    pr.scales.containsKey("current_a"), false);
-        }
-        check("TacoGotion cells are 10 mV", Presets.identify30xx(2, 1).scales.get("cell_min_mv"), "10;0;2");
-        check("TacoGotion current: 0.1 A/count, zero 6000",
-                Presets.identify30xx(2, 1).currentScale + "/" + Presets.identify30xx(2, 1).currentZero, "0.1/6000");
-        check("CESL current: 0.5 A/count, zero 2000",
-                Presets.identify30xx(1, 1).currentScale + "/" + Presets.identify30xx(1, 1).currentZero, "0.5/2000");
     }
 
     /**
-     * The Tiago EV's VECU mirror, as one owner's scan saw it: cells in 10 mV,
+     * A 10 mV-cell controller, as one owner's scan saw it: cells in 10 mV,
      * a live pack voltage, two constant-5000 placeholder rails and a
      * whole-percent SOC. The old heuristic offered the rails as cells.
      */
@@ -2271,10 +2210,11 @@ public final class SelfTest {
                 DidScanner.socCandidates(Arrays.asList(hit("3402", 2, "0375", "0378")),
                         DidScanner.suggest(Arrays.asList(hit("3402", 2, "0375", "0378")))).isEmpty(), true);
         movingCellIsNotSoc();
+        tiagoSecondScan();
     }
 
     /**
-     * The same Tiago mirror with a LIVE pack - the cells and the pack voltage
+     * The same 10 mV controller with a LIVE pack - the cells and the pack voltage
      * move between samples, as they do on any car that is not parked.
      *
      * A 10 mV cell reads 200..450, which is inside the SOC window, and the SOC
@@ -2312,6 +2252,193 @@ public final class SelfTest {
         check("...and the moving cell is not among the choices",
                 socDids.contains("3477") || socDids.contains("3478"), false);
         genuineTenthsSocSurvives();
+    }
+
+    /**
+     * The Tiago's second scan (2026-09-04). suggest() named 34E4 = 5 as SOC:
+     * 0.5 % on a pack at 3.31 V/cell. And the whole-percent list offered 3539,
+     * which fell from 75 to 48 inside one scan. Neither is an SOC.
+     */
+    private static void tiagoSecondScan() throws Exception {
+        System.out.println("\n=== Tiago second scan: SOC plausibility ===");
+        List<DidScanner.Hit> t = new ArrayList<>(Arrays.asList(
+                hit("341E", 2, "0CE8", "0CE9"), hit("3477", 2, "014C", "014C"),
+                hit("3478", 2, "014A", "014A"), hit("341D", 2, "1770", "1770"),
+                hit("3500", 2, "1388", "1388"), hit("3501", 2, "1388", "1388"),
+                hit("34E4", 2, "0005", "0004"), hit("3537", 2, "011D", "0100"),
+                hit("3539", 2, "004B", "0030"), hit("34F4", 2, "0019", "0019"),
+                hit("3536", 2, "0019", "0019"), hit("3421", 2, "02F6", "02F6"),
+                hit("3432", 1, "2A", "29"), hit("345F", 1, "64", "63")));
+        List<DidScanner.VoltageHypothesis> vh = DidScanner.voltageHypotheses(t);
+        check("one reading, the right one", vh.size() == 1 && vh.get(0).packDid.equals("341E")
+                && vh.get(0).cellUnitMv == 10, true);
+        Map<String, String> s = DidScanner.suggest(t, vh);
+        check("0.5 % is not suggested as SOC at 3.31 V/cell", s.get("soc_pct"), null);
+        check("floor is 10 % on an LFP plateau", DidScanner.socFloorTenths(vh), 100);
+        check("no hypotheses, no floor", DidScanner.socFloorTenths(new ArrayList<>()), 0);
+        List<String> whole = new ArrayList<>();
+        for (DidScanner.Hit h : DidScanner.socCandidates(t, s)) whole.add(h.did);
+        check("a value that fell 27 points inside one scan is not offered", whole.contains("3539"), false);
+        check("steady whole-percent candidates are still offered", whole.contains("34F4") && whole.contains("3536"), true);
+        List<String> tenths = new ArrayList<>();
+        for (DidScanner.Hit h : DidScanner.socCandidatesTenths(t, vh, s)) tenths.add(h.did);
+        check("a 29-count swing is not a tenths SOC either", tenths.contains("3537"), false);
+        check("swing rule: 285 -> 256 fails at 20", DidScanner.socSwingOk(hit("3537", 2, "011D", "0100"), 20), false);
+        check("swing rule: 885 -> 888 passes", DidScanner.socSwingOk(hit("3402", 2, "0375", "0378"), 20), true);
+        // The Nexon still maps its SOC.
+        List<DidScanner.Hit> n = new ArrayList<>(Arrays.asList(
+                hit("3400", 2, "0D87", "0D88"), hit("3415", 2, "0D00", "0D02"),
+                hit("3417", 2, "0CF7", "0CF8"), hit("3402", 2, "0375", "0378")));
+        check("Nexon SOC still suggested", DidScanner.suggest(n).get("soc_pct"), "3402");
+    }
+
+    /**
+     * When the dashboard cannot decode anything, the owner has a screenshot of
+     * "--" and nothing else. This is the evidence: what was asked, what came
+     * back, with the VIN read left out of the buffer and any VIN-shaped run
+     * scrubbed on the way to the page.
+     */
+    private static void pollReport() {
+        System.out.println("\n=== poll report ===");
+        check("a VIN-shaped run is scrubbed", Redact.withoutVin("x MAT612345TEST0000 y"), "x \u2026 y");
+        check("short runs survive", Redact.withoutVin("7E3 62341E0CE8"), "7E3 62341E0CE8");
+        check("null is empty", Redact.withoutVin(null), "");
+        List<String> roles = Arrays.asList("pack_v=341E", "cell_min_mv=3478", "cell_max_mv=3477", "soc_pct=3421");
+        String traffic = "> 22341E34013478\nNO DATA\n\n> 22341E\n7EB0562341E0CE8\n\n> 22F190\n(VIN read - not recorded)";
+        String r = PollReport.render("Adapter: ELM327 v2.1\nAdapter rejected: none\n", "1.2", "ATSP6", "785",
+                true, roles, traffic, "no usable reading in 3 polls",
+                "NRC 78", "accepted");
+        check("names the target", r.contains("Target: 785"), true);
+        check("says whether batching was on", r.contains("Batching: on"), true);
+        check("lists the roles asked", r.contains("pack_v=341E"), true);
+        check("carries the traffic", r.contains("> 22341E34013478"), true);
+        check("carries the reason", r.contains("no usable reading"), true);
+        check("no VIN-shaped run", r.matches("(?s).*[A-HJ-NPR-Z0-9]{17}.*"), false);
+        check("ends with newline", r.endsWith("\n"), true);
+        // How the VIN read went, never what it said.
+        check("VIN read outcome is stated", r.contains("VIN read: NRC 78"), true);
+        check("session outcome is stated", r.contains("Session: accepted"), true);
+        String leaky = PollReport.render("", "1.2", "ATSP6", "785", false, roles,
+                "> 22F190\n7EB1014...4D41543631323334355445535430303030", "x",
+                "no reply", "refused NRC 22");
+        check("a VIN that slipped into traffic is scrubbed anyway",
+                leaky.matches("(?s).*[A-HJ-NPR-Z0-9]{17}.*"), false);
+        check("batching off is said too", leaky.contains("Batching: off"), true);
+        check("a failed VIN read is stated too", leaky.contains("VIN read: no reply"), true);
+        check("a refused session is stated", leaky.contains("Session: refused NRC 22"), true);
+    }
+
+    /**
+     * One failed identification read must not strand an owner.
+     *
+     * The ECU has served its VIN before - the profile is named from it -
+     * but under a sweep's load the read came back busy, the scan looked VIN-less,
+     * and the guard refused every button on the screen with no way forward.
+     */
+    private static void idReads() {
+        System.out.println("\n=== identification reads: retry rule, scan gate ===");
+        UdsCodec.Response pending = new UdsCodec.Response("7EB", true, 0x78, null, null);
+        UdsCodec.Response busy = new UdsCodec.Response("7EB", true, 0x21, null, null);
+        UdsCodec.Response outOfRange = new UdsCodec.Response("7EB", true, 0x31, null, null);
+        UdsCodec.Response ok = new UdsCodec.Response("7EB", false, -1, "F190", new byte[]{0x4D});
+        check("silence deserves a retry", UdsCodec.isTransientNegative(null), true);
+        check("response pending deserves a retry", UdsCodec.isTransientNegative(pending), true);
+        check("busy deserves a retry", UdsCodec.isTransientNegative(busy), true);
+        check("request out of range is final", UdsCodec.isTransientNegative(outOfRange), false);
+        check("a positive reply is final", UdsCodec.isTransientNegative(ok), false);
+
+        check("scan VIN matches the profile: allow",
+                ProfileMatch.scanWriteGate("MAT612345TEST0000", "MAT612345TEST0000", 1, 1), ProfileMatch.ScanGate.ALLOW);
+        check("no VIN anywhere: allow",
+                ProfileMatch.scanWriteGate("", "", -1, 1), ProfileMatch.ScanGate.ALLOW);
+        check("no VIN read, profile bound to one: ask",
+                ProfileMatch.scanWriteGate("", "MAT612345TEST0000", -1, 1), ProfileMatch.ScanGate.ASK_SAME_CAR);
+        check("different VIN than the profile: block",
+                ProfileMatch.scanWriteGate("MAT612345TEST0000", "MAT699999TEST0000", -1, 1), ProfileMatch.ScanGate.BLOCK_DIFFERENT_CAR);
+        check("scanned VIN owned by another profile: block",
+                ProfileMatch.scanWriteGate("MAT612345TEST0000", "", 2, 1), ProfileMatch.ScanGate.BLOCK_DIFFERENT_CAR);
+        check("scanned VIN owned by THIS profile: allow",
+                ProfileMatch.scanWriteGate("MAT612345TEST0000", "", 1, 1), ProfileMatch.ScanGate.ALLOW);
+        check("null scan VIN reads as none",
+                ProfileMatch.scanWriteGate(null, "MAT612345TEST0000", -1, 1), ProfileMatch.ScanGate.ASK_SAME_CAR);
+    }
+
+    /**
+     * A role can be switched OFF, not merely remapped.
+     *
+     * A voltage reading whose pack DID is some logged-only role's DEFAULT used to
+     * be unmappable from every screen: the pick was refused for the clash, and
+     * nothing could move the other role out of the way, because clearing an
+     * override restores a default rather than removing it. "-" in an override
+     * says "this role is not read on this car", which is a thing an owner of an
+     * unknown model needs to be able to say.
+     */
+    private static void disabledRoles() throws Exception {
+        System.out.println("\n=== a role switched off ===");
+        check("the marker", BmsFields.DISABLED, "-");
+        check("recognised", BmsFields.isDisabled("-"), true);
+        check("...with whitespace", BmsFields.isDisabled(" - "), true);
+        check("a DID is not the marker", BmsFields.isDisabled("341E"), false);
+        check("empty is not the marker", BmsFields.isDisabled(""), false);
+        check("null is not the marker", BmsFields.isDisabled(null), false);
+
+        Prefs p = new Prefs();
+        p.dids.put("link_v", BmsFields.DISABLED);
+        check("a disabled role has no DID to read",
+                BmsFields.effectiveDid(BmsFields.byKey("link_v"), p), null);
+        check("...its neighbours are unaffected",
+                BmsFields.effectiveDid(BmsFields.byKey("busbar_neg_v"), p), "3481");
+        check("no prefs at all, always the default",
+                BmsFields.effectiveDid(BmsFields.byKey("link_v"), null), "3482");
+        String h = CsvFormat.header(BmsFields.ALL, p);
+        check("the header says the column is not read", h.contains("raw_link_v_none"), true);
+        check("...and still names every other role", h.contains("raw_pack_v_3400"), true);
+        check("...with the role column itself unchanged", h.contains(",link_v,"), true);
+
+        // Clash filter: what Scan applies drops a role whose DID another role
+        // already reads, and says which one was in the way.
+        Map<String, String> wanted = new java.util.LinkedHashMap<>();
+        wanted.put("soh_pct", "3421");
+        wanted.put("temp_a_c", "3423");
+        Map<String, String> taken = new java.util.LinkedHashMap<>();
+        taken.put("soc_pct", "3421");
+        List<String> skipped = new ArrayList<>();
+        Map<String, String> kept = DidScanner.withoutClashes(wanted, taken, skipped);
+        check("the clashing role is dropped", kept.containsKey("soh_pct"), false);
+        check("the clean role is kept", kept.get("temp_a_c"), "3423");
+        check("the skip is explained", skipped.size() == 1 && skipped.get(0).contains("soc_pct"), true);
+
+        // planApply: the same decision, for the screens that apply a pick.
+        Map<String, String> want = new java.util.LinkedHashMap<>();
+        want.put("pack_v", "3482");
+        want.put("cell_max_mv", "3415");
+        want.put("cell_min_mv", "3417");
+        Map<String, String> inForce = new java.util.LinkedHashMap<>();
+        for (BmsFields.Field f : BmsFields.ALL) {
+            if (!want.containsKey(f.key)) inForce.put(f.key, f.did);
+        }
+        DidScanner.ApplyPlan plan = DidScanner.planApply(want, inForce);
+        check("a logged-only collision is planned as a switch-off",
+                plan.disable.toString(), "[link_v]");
+        check("...and the pick itself applies whole", plan.apply.size(), 3);
+        check("...with no refusal", plan.refusal, null);
+
+        Map<String, String> primaryClash = new java.util.LinkedHashMap<>(inForce);
+        primaryClash.put("link_v", null);
+        primaryClash.put("soc_pct", "3482");
+        DidScanner.ApplyPlan refused = DidScanner.planApply(want, primaryClash);
+        check("a primary collision refuses the whole pick", refused.apply.isEmpty(), true);
+        check("...naming the role in the way", refused.refusal.contains("soc_pct"), true);
+        check("...and switches nothing off", refused.disable.isEmpty(), true);
+
+        Map<String, String> single = new java.util.LinkedHashMap<>();
+        single.put("soc_pct", "3421");
+        DidScanner.ApplyPlan simple = DidScanner.planApply(single, inForce);
+        check("a clean pick switches nothing off", simple.disable.isEmpty(), true);
+        check("...and applies as asked", simple.apply.get("soc_pct"), "3421");
+        check("...with no refusal", simple.refusal, null);
+        check("a role already switched off owns no DID and blocks nothing",
+                DidScanner.planApply(want, primaryClash).disable.isEmpty(), true);
     }
 
     /**
@@ -2491,6 +2618,26 @@ public final class SelfTest {
         LogReader.Result r = LogReader.read(f);
         check("rows read", r.rows, 40);
         check("older layout detected", r.flipCorrected, true);
+        // A car with a role switched off writes raw_<role>_none. The reader finds
+        // a column by its DID suffix, so a non-hex one matches nothing and is
+        // simply never consulted - including by the flip-era check.
+        java.io.File off = java.io.File.createTempFile("bmsoff", ".csv");
+        off.deleteOnExit();
+        java.io.PrintWriter ow = new java.io.PrintWriter(off, "UTF-8");
+        ow.println("epoch_ms,timestamp,pack_v,current_a,cell_min_mv,cell_min_idx,"
+                + "cell_max_mv,cell_max_idx,raw_cell_min_idx_341A,raw_cell_max_idx_3419,"
+                + "raw_link_v_none,app_ver");
+        for (int i = 0; i < 20; i++) {
+            ow.printf(java.util.Locale.US,
+                    "%d,2026-09-05 10:00:%02d,346.0,%.1f,3300,77,3340,4,4D,04,,1.2%n",
+                    1787630000000L + i * 1000L, i % 60, -40 + i * 4.0);
+        }
+        ow.close();
+        LogReader.Result offR = LogReader.read(off);
+        check("a switched-off role's column does not stop a replay", offR.rows, 20);
+        check("...and is not mistaken for the older layout", offR.flipCorrected, false);
+        check("...while the real index columns still resolve",
+                offR.map.group(77).minCount, 20);
         check("app version carried through", r.appVersion, "3.2");
         // 77 was in the cell_max_idx COLUMN, but the DID says that column is the
         // minimum - so 77 must be counted as having held the minimum.
@@ -2500,6 +2647,12 @@ public final class SelfTest {
                 r.map.group(4).maxCount, 40);
         check("weakest group is the one the DID says",
                 r.map.weakestGroup(), 77);
+        // The replayed map carries each row's clock into the group history, so
+        // the per-CSV pack map can show WHEN a group was the extreme. The last
+        // row is i = 39: epoch 1787630000000 + 39000, cell_min_idx column 4.
+        PackMap.Snapshot last = r.map.snapshot(4);
+        check("replayed moment carries the row's epoch",
+                last.recent.get(0).atMs, 1787630039000L);
     }
 
     // ------------------------------------------------------- adapter refusal
@@ -2547,7 +2700,6 @@ public final class SelfTest {
         check("family folds the id", AdapterCaps.family("ATSH 18DA96F1"), "ATSH");
         check("protocol commands stay distinct", AdapterCaps.family("ATTP7"), "ATTP7");
         check("...and ATSP6 is not one of them", AdapterCaps.family("ATSP6"), "ATSP6");
-        check("priority byte folds", AdapterCaps.family("ATCP1B"), "ATCP");
         check("the pre-v1.3 filter pair folds", AdapterCaps.family("ATCF18DAF196")
                 + "/" + AdapterCaps.family("ATCM1FFFFFFF"), "ATCF/ATCM");
         check("plain commands are their own family", AdapterCaps.family("ATFCSD300000"), "ATFCSD300000");
@@ -2559,6 +2711,25 @@ public final class SelfTest {
         quiet.note("ATCRA78D", "OK");
         check("a genuine adapter is not a clone", quiet.looksLikeClone(), false);
         check("no banner is said, not blank", new AdapterCaps().report().contains("(no banner)"), true);
+    }
+
+    /**
+     * What one read of the controller means. An empty reply has three causes and
+     * only one of them is "the adapter is not answering", so the verdict has to
+     * use the banner the adapter gave up a moment earlier.
+     */
+    private static void probeClassification() {
+        System.out.println("\n=== probe classification ===");
+        check("no banner, empty read: the adapter is dead",
+                ConnectPlan.classify(false, "", false), ConnectPlan.Probe.ADAPTER_SILENT);
+        check("banner seen, empty read: the car did not answer",
+                ConnectPlan.classify(true, "", false), ConnectPlan.Probe.NO_REPLY);
+        check("NO DATA is the adapter talking, not the car",
+                ConnectPlan.classify(true, "NO DATA", false), ConnectPlan.Probe.NO_REPLY);
+        check("a UDS frame from 78D is an answer",
+                ConnectPlan.classify(true, "78D0362F197...", true), ConnectPlan.Probe.ANSWERED);
+        check("a refusal is still an answer",
+                ConnectPlan.classify(true, "78D037F2231", true), ConnectPlan.Probe.ANSWERED);
     }
 
     /**
@@ -2595,16 +2766,17 @@ public final class SelfTest {
     // ---------------------------------------- third review: pure decisions
 
     private static void requestIdBound() {
-        System.out.println("\n=== request id bound and read framing ===");
-        check("785 is a valid request id", CommandGuard.isRequestId("785"), true);
-        check("7F7 is the last id whose reply fits 11 bits", CommandGuard.isRequestId("7F7"), true);
-        check("7F8 would reply on 800", CommandGuard.isRequestId("7F8"), false);
-        check("FFF rejected", CommandGuard.isRequestId("FFF"), false);
-        check("two digits rejected", CommandGuard.isRequestId("85"), false);
-        check("blank rejected", CommandGuard.isRequestId(""), false);
-        check("null rejected", CommandGuard.isRequestId(null), false);
-        check("non-hex rejected", CommandGuard.isRequestId("7G5"), false);
-        check("lower case accepted", CommandGuard.isRequestId("7a5"), true);
+        System.out.println("\n=== response id pairing and read framing ===");
+        // The pairing target() depends on: reply = request + 8. The typed-address
+        // validator that used to be checked here went with the typed address.
+        check("response for a request", UdsCodec.responseIdFor("785"), "78D");
+        check("7F7 is the last request whose reply fits 11 bits",
+                UdsCodec.responseIdFor("7F7"), "7FF");
+        check("7F8 would reply on 800, which the adapter could never show",
+                UdsCodec.responseIdFor("7F8"), null);
+        check("non-hex rejected", UdsCodec.responseIdFor("7G5"), null);
+        check("lower case accepted", UdsCodec.responseIdFor("7a5"), "7AD");
+        check("an eight-digit id is no longer an id", UdsCodec.responseIdFor("18DA96F1"), null);
         check("odd nibble read refused", CommandGuard.isAllowed("22F19"), false);
         check("half a DID refused", CommandGuard.isAllowed("22F19034"), false);
         check("three DIDs allowed", CommandGuard.isAllowed("22F19034023401"), true);

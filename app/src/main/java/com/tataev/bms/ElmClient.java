@@ -27,11 +27,6 @@ final class ElmClient {
     private static final String TAG = "ElmClient";
     private static final UUID SPP = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB");
 
-    /** Whole-detection time budget, so a dead link cannot hang for minutes. */
-    private static final long DETECT_BUDGET_MS = 90_000L;
-    /** Consecutive silent candidates that mean the link, not the address, is bad. */
-    private static final int SILENT_LIMIT = 8;
-
     // Volatile because abort() is called from the main thread to unstick a
     // connect() blocking on the worker, so both threads must see the same socket.
     private volatile BluetoothSocket socket;
@@ -40,41 +35,17 @@ final class ElmClient {
     private String responseId = "78D";
 
     /**
-     * The protocol-select command in force; applied by initAdapter() and
-     * switchProtocol().
+     * The one wire this app speaks: ISO 15765-4, CAN 11-bit, 500 kbaud.
      *
-     * ATSP6 by default, and ATSP deliberately: 11-bit CAN at 500 kbaud is what
-     * every Tata EV this app was written on uses, it is the adapter's own
-     * sensible default, and persisting it to the dongle's EEPROM changes nothing
-     * about what the next tool sees. Every rung the LADDER probes with is an
-     * ATTP instead - see ProtocolLadder - so a failed detection never leaves the
-     * dongle defaulting to 29-bit or 250 kbaud. Always set explicitly here, so
-     * nothing depends on what the adapter remembers.
+     * ATSP and not ATTP deliberately: this is the adapter's own sensible default,
+     * it is what every Tata EV uses, and persisting it to the dongle's EEPROM
+     * changes nothing about what the next tool sees. Always set explicitly by
+     * initAdapter(), so nothing depends on what the adapter remembers.
      */
-    private String protocol = "ATSP6";
-    /** Hex digits in a printed CAN id under that protocol: 3 or 8. */
-    private int idLen = 3;
-
-    /** Choose the protocol the NEXT initAdapter() will set. */
-    void useProtocol(String atsp) {
-        ProtocolLadder.Rung r = ProtocolLadder.forProtocol(atsp);
-        protocol = r.atsp;
-        idLen = r.idLen;
-    }
-
-    /** Change protocol on a live, initialised adapter - the ladder's step. */
-    void switchProtocol(String atsp) throws IOException {
-        useProtocol(atsp);
-        at(protocol, 2000);
-    }
+    private static final String PROTOCOL = "ATSP6";
 
     String protocol() {
-        return protocol;
-    }
-
-    /** A line for the detection transcript, e.g. which rung is being tried. */
-    void noteInLog(String line) {
-        detectLog.append(line).append('\n');
+        return PROTOCOL;
     }
 
     boolean isConnected() {
@@ -160,13 +131,38 @@ final class ElmClient {
 
     /** Set by {@link #abort()}, so an aborted connect does not open a second socket. */
     private volatile boolean aborted;
-    /** How many addresses gave a UDS reply in the last detection sweep. */
-    private int lastDetectAnswered;
-    /** Transcript of the last detection, for the shareable report. */
-    private final StringBuilder detectLog = new StringBuilder();
 
     /** What the adapter answered during setup, for the report headers. */
     private final AdapterCaps caps = new AdapterCaps();
+
+    /**
+     * The last few exchanges, for the poll report.
+     *
+     * A dashboard that decodes nothing is unexplainable from a screenshot: what
+     * matters is which request shape got which reply, and only the adapter saw
+     * that. Small and bounded - this runs on every read of every poll.
+     *
+     * The VIN read's REPLY is never recorded. That is the primary guarantee; the
+     * renderer's scrub is the second one.
+     */
+    private static final int RECENT_MAX = 24;
+    private final java.util.ArrayDeque<String> recent = new java.util.ArrayDeque<>();
+
+    /**
+     * How the last VIN read and the last session request went - the OUTCOMES, so
+     * a report can say whether identification was refused, timed out or simply
+     * never asked, without ever carrying the VIN itself.
+     */
+    private volatile String lastVinReadOutcome = "";
+    private volatile String lastSessionOutcome = "";
+
+    String lastVinReadOutcome() {
+        return lastVinReadOutcome;
+    }
+
+    String lastSessionOutcome() {
+        return lastSessionOutcome;
+    }
 
     AdapterCaps caps() {
         return caps;
@@ -186,6 +182,11 @@ final class ElmClient {
 
     void connect(BluetoothDevice device) throws IOException {
         close();
+        synchronized (recent) {
+            recent.clear();       // a new link's report is about THIS link
+        }
+        lastVinReadOutcome = "";
+        lastSessionOutcome = "";
         // aborted is NOT cleared here. It is set only by abort(), whose one
         // caller is BmsService.onDestroy - the service is going away and the
         // worker is being joined, so nothing legitimately connects again on this
@@ -280,7 +281,36 @@ final class ElmClient {
             String t = line.trim();
             if (!t.isEmpty() && !t.equals(cmd)) cleaned.append(t).append('\n');
         }
-        return cleaned.toString().trim();
+        String reply = cleaned.toString().trim();
+        record(cmd, reply);
+        return reply;
+    }
+
+    /** One exchange into the ring buffer, with the VIN read's answer left out. */
+    private void record(String cmd, String reply) {
+        // The VIN read's SHAPE is what a report needs - whether it answered, was
+        // refused, or timed out - and its bytes are the one thing that must never
+        // be written down. Decode it, keep the outcome, drop the text.
+        String entry = cmd.toUpperCase(Locale.ROOT).contains("F190")
+                ? "> " + cmd + "\n(VIN read: "
+                        + outcomeOf(UdsCodec.decode22(reply, responseId)) + ")"
+                : "> " + cmd + "\n" + (reply.isEmpty() ? "(no reply)" : reply);
+        synchronized (recent) {
+            recent.addLast(entry);
+            while (recent.size() > RECENT_MAX) recent.removeFirst();
+        }
+    }
+
+    /** The last {@value #RECENT_MAX} exchanges, oldest first, for the poll report. */
+    String recentTraffic() {
+        StringBuilder sb = new StringBuilder();
+        synchronized (recent) {
+            for (String e : recent) {
+                if (sb.length() > 0) sb.append("\n\n");
+                sb.append(e);
+            }
+        }
+        return sb.toString();
     }
 
     /** Send a UDS request. The allowlist in {@link #raw} does the vetting. */
@@ -297,31 +327,8 @@ final class ElmClient {
         at("ATS0", 2000);
         at("ATH1", 2000);      // headers on: we must see which ECU replied
         at("ATCAF1", 2000);
-        at(protocol, 2000);    // ISO 15765-4; ATSP6 unless the ladder chose otherwise
+        at(PROTOCOL, 2000);    // ISO 15765-4, CAN 11-bit, 500 kbaud
         at("ATAT1", 2000);
-    }
-
-    /**
-     * Point the session at a BMS and open the extended session.
-     *
-     * Tata EVs use non-standard 0x7xx diagnostic addressing (the ISO 7E0..7E7
-     * block is mostly silent), and the address differs between models, so the
-     * caller supplies one - normally from {@link #detectBms}.
-     */
-    void initAndTargetBms(String requestId) throws IOException {
-        initAdapter();
-        targetAndOpenSession(requestId);
-    }
-
-    /**
-     * Aim at an address and open the extended session, WITHOUT resetting the
-     * adapter. After {@link #detectBms} the adapter is already initialised, and a
-     * second ATZ is a hardware reset that discards ATH1/ATSP6/ATCAF1 and costs
-     * ~20 s for no benefit.
-     */
-    void targetAndOpenSession(String requestId) throws IOException {
-        target(requestId);
-        enterExtendedSession();
     }
 
     /**
@@ -333,264 +340,61 @@ final class ElmClient {
      */
     boolean enterExtendedSession() throws IOException {
         String text = raw("1003", 4000);
-        byte[] p = UdsCodec.reassemble(text, idLen).get(responseId);
-        return p != null && p.length > 0 && (p[0] & 0xFF) == 0x50;
-    }
-
-    /** What {@link #detectBms} found. */
-    static final class BmsInfo {
-        final String requestId;
-        final String responseId;
-        final String systemName;
-        final String supplier;
-        /** The ATSP rung this address answered on, so it can be saved and reopened. */
-        final String protocol;
-        /** Which DID block its data lives in: "34xx", "30xx", or null if unknown. */
-        final String dialect;
-
-        BmsInfo(String requestId, String responseId, String systemName, String supplier,
-                String protocol, String dialect) {
-            this.requestId = requestId;
-            this.responseId = responseId;
-            this.systemName = systemName;
-            this.supplier = supplier;
-            this.protocol = protocol;
-            this.dialect = dialect;
+        byte[] p = UdsCodec.reassemble(text).get(responseId);
+        boolean accepted = p != null && p.length > 0 && (p[0] & 0xFF) == 0x50;
+        // Recorded for the reports: an ECU that refuses the extended session is a
+        // different problem from one that never answered the request at all.
+        if (accepted) {
+            lastSessionOutcome = "accepted";
+        } else if (p != null && p.length > 2 && (p[0] & 0xFF) == 0x7F) {
+            lastSessionOutcome = String.format(Locale.ROOT, "refused NRC %02X", p[2] & 0xFF);
+        } else {
+            lastSessionOutcome = p == null || p.length == 0 ? "no reply" : "unexpected reply";
         }
+        return accepted;
     }
+
+    static final int ID_READ_ATTEMPTS = 3;
+    static final long ID_READ_PAUSE_MS = 300;
 
     /**
-     * Find the BMS by asking each candidate address for its own name (DID F197)
-     * and keeping the one that calls itself a BMS. Falls back to any ECU whose
-     * supplier string mentions a known battery vendor, and then to any ECU whose
-     * DATA looks like a battery's - a plausible state of charge and pack voltage
-     * on the known DIDs - so a model whose BMS is named something unexpected is
-     * still found without anyone typing an address.
+     * Identification DIDs are read once per connect and decide which profile a car
+     * is, so a busy or pending reply must not stand as the answer. Up to three
+     * reads, a short pause between; a final NRC or a positive reply stops early.
      *
-     * Pure reads throughout.
+     * This is what one owner hit: the ECU had served its VIN before - the
+     * profile is named from it - but under load one read came back busy, the
+     * scan looked VIN-less, and every apply on the screen was refused.
      */
-    BmsInfo detectBms(java.util.List<String> candidates, ProgressSink progress)
-            throws IOException {
-        initAdapter();
-        detectLog.setLength(0);
-        return sweepCandidates(candidates, progress);
-    }
-
-    /**
-     * The identification sweep alone, for an adapter that is already
-     * initialised - broadcast discovery re-runs it over the addresses it heard.
-     */
-    BmsInfo sweepCandidates(java.util.List<String> candidates, ProgressSink progress)
-            throws IOException {
-        BmsInfo bySupplier = null;
-        BmsInfo byContent = null;
-        long deadline = SystemClock.elapsedRealtime() + DETECT_BUDGET_MS;
-        int silentInARow = 0;
-        int answered = 0;
-        lastDetectAnswered = 0;
-        for (String req : candidates) {
-            // !isConnected(): after abort() every target() throws, and grinding
-            // through the rest of the list would end in a false "no BMS".
-            if (Thread.currentThread().isInterrupted() || !isConnected()) break;
-            if (SystemClock.elapsedRealtime() > deadline) {
-                throw new IOException("BMS detection timed out");
-            }
-            // A dead socket never throws - raw() just spins to its timeout and
-            // returns "" - so give up rather than grind through every candidate.
-            // A live adapter prints NO DATA for a silent ECU, which is not "",
-            // so only the adapter's own silence counts here.
-            if (silentInARow >= SILENT_LIMIT) {
-                throw new IOException("adapter stopped responding during detection");
-            }
-            if (progress != null) progress.onProgress("probing " + req + "...");
-            try {
-                target(req);
-            } catch (IOException e) {
-                continue;
-            }
-            String reply;
-            try {
-                reply = raw("22" + BmsFields.DID_SYSTEM_NAME, 1500);
-            } catch (IOException e) {
-                reply = "";
-            }
-            if (reply == null || reply.trim().isEmpty()) {
-                silentInARow++;
-                detectLog.append(req).append(": adapter silent\n");
-                continue;
-            }
-            silentInARow = 0;
-            // Only a UDS frame from this address counts as an answer. NO DATA
-            // and CAN ERROR are the adapter talking, not the car.
-            UdsCodec.Response idReply = UdsCodec.decode22(reply, responseId);
-            if (idReply == null) {
-                detectLog.append(req).append(": no UDS reply\n");
-                continue;
-            }
-            answered++;
-            lastDetectAnswered = answered;
-            // Any reply - a name or a refusal - proves an ECU lives here. One
-            // that serves the data DIDs but not F197 (a case establish() accepts
-            // for a saved address) still gets the content check below.
-            String name = asIdString(UdsCodec.decode22(reply, responseId,
-                    BmsFields.DID_SYSTEM_NAME));
-            String supplier = name == null ? null : readIdString(BmsFields.DID_SUPPLIER);
-            // Locale.ROOT: "Gotion" upper-cases to "GOTİON" in Turkish, so the
-            // supplier fallback would never match on a Turkish-locale phone.
-            String upperName = name == null ? "" : name.toUpperCase(Locale.ROOT);
-            String upperSup = supplier == null ? "" : supplier.toUpperCase(Locale.ROOT);
-            detectLog.append(req).append(": answered  name=")
-                     .append(name == null ? "-" : name)
-                     .append("  supplier=").append(supplier == null ? "-" : supplier)
-                     .append('\n');
-
-            if (upperName.contains("BMS") || upperName.contains("BATTERY")) {
-                detectLog.append("  ^ identified by name\n");
-                return new BmsInfo(req, responseId, name, supplier == null ? "" : supplier,
-                        protocol, batteryDialect());
-            }
-            if (bySupplier == null && name != null && (upperSup.contains("GOTION")
-                    || upperSup.contains("BMS") || upperSup.contains("CATL")
-                    || upperSup.contains("LG"))) {
-                detectLog.append("  ^ battery-vendor supplier\n");
-                bySupplier = new BmsInfo(req, responseId, name, supplier, protocol,
-                        batteryDialect());
-            }
-            if (bySupplier == null && byContent == null) {
-                String dialect = batteryDialect();
-                if (dialect != null) {
-                    detectLog.append("  ^ data looks like a battery (").append(dialect).append(" block)\n");
-                    byContent = new BmsInfo(req, responseId, name == null ? "" : name,
-                            supplier == null ? "" : supplier, protocol, dialect);
+    UdsCodec.Response readIdResponse(String did) throws IOException {
+        UdsCodec.Response last = null;
+        for (int attempt = 1; attempt <= ID_READ_ATTEMPTS; attempt++) {
+            last = readDid(did);
+            if (!UdsCodec.isTransientNegative(last)) break;
+            if (attempt < ID_READ_ATTEMPTS) {
+                try {
+                    Thread.sleep(ID_READ_PAUSE_MS);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    break;
                 }
             }
         }
-        return bySupplier != null ? bySupplier : byContent;
+        if (BmsFields.DID_VIN.equalsIgnoreCase(did)) lastVinReadOutcome = outcomeOf(last);
+        return last;
     }
 
-    /**
-     * After a sweep that found nothing: how many addresses answered at all.
-     * Zero means the car is asleep or off, or every ECU lives somewhere this
-     * app does not look - not that the car has no battery controller.
-     */
-    int lastDetectAnswered() {
-        return lastDetectAnswered;
-    }
-
-    /** What the last detection saw, address by address. */
-    String detectionLog() {
-        return detectLog.toString();
-    }
-
-    /**
-     * Ask the WHOLE bus who is there: functional-broadcast probes with the
-     * receive filter open. Every UDS-capable ECU that answers reveals its CAN
-     * id, and the ids are the whole yield. Both probes fit a single frame each
-     * way, so no ISO-TP flow control is ever involved. Pure reads, same guard.
-     *
-     * @param functionalIds broadcast request ids for the protocol in force -
-     *                      7DF at 11-bit; 18DB33F1 and Tata's 1BDB33F1 at 29-bit
-     * @return request ids heard, deduplicated; empty on failure
-     */
-    java.util.List<String> discoverEcus(java.util.List<String> functionalIds) {
-        java.util.List<String> ids = new java.util.ArrayList<>();
-        for (String fid : functionalIds) {
-            try {
-                at("ATCRA", 2000);          // open the filter: hear everyone
-                // A clone that refuses ATCRA is still behind whatever window the
-                // last target() left, so it would hear ONE ECU answer the
-                // broadcast and report the bus as nearly empty. The mask does
-                // the same job one level down: all-zero bits means "compare
-                // nothing", i.e. accept every id. Same allowlisted ATCM as
-                // target()'s fallback, only fully open rather than one address.
-                if (!caps.supports("ATCRA")) {
-                    at("ATCM" + (idLen == 8 ? "00000000" : "000"), 2000);
-                }
-                setHeader(fid);
-                for (String probe : new String[]{"3E00", "22F186"}) {
-                    String text;
-                    try {
-                        text = raw(probe, 2500);
-                    } catch (IOException e) {
-                        continue;
-                    }
-                    for (String resp : UdsCodec.respondingIds(text, idLen)) {
-                        String req = UdsCodec.requestIdFor(resp);
-                        if (req != null && !ids.contains(req)) ids.add(req);
-                    }
-                }
-            } catch (IOException ignored) {
-                // a failed discovery just means no extra candidates
-            }
-        }
-        detectLog.append("broadcast heard (").append(protocol).append("): ")
-                 .append(ids.isEmpty() ? "nothing" : ids.toString()).append('\n');
-        return ids;
-    }
-
-    java.util.List<String> discoverEcus() {
-        return discoverEcus(ProtocolLadder.forProtocol(protocol).functional);
-    }
-
-    /** Reply widths from the last dialect probe, for Presets.identify30xx. */
-    private int lastSocLen, lastIdxLen;
-
-    int lastSocLen() {
-        return lastSocLen;
-    }
-
-    int lastIdxLen() {
-        return lastIdxLen;
-    }
-
-    /**
-     * Which DID block serves plausible battery data here: "34xx" (Gotion, the
-     * Nexon's), "30xx" (TacoGotion / CESL / Kratos), or null. Content, not name:
-     * two or three reads per block, all harmless.
-     */
-    private String batteryDialect() {
-        if (plausibleBattery("3402", "3400")) return "34xx";
-        if (plausibleBattery("300F", "300D")) {
-            try {
-                UdsCodec.Response idx = readDid("3019");
-                lastIdxLen = idx != null && idx.isData() ? idx.data.length : 1;
-            } catch (IOException e) {
-                lastIdxLen = 1;
-            }
-            return "30xx";
-        }
-        return null;
-    }
-
-    private boolean plausibleBattery(String socDid, String packDid) {
-        try {
-            UdsCodec.Response soc = readDid(socDid);
-            UdsCodec.Response pack = readDid(packDid);
-            if (soc == null || pack == null || !soc.isData() || !pack.isData()) return false;
-            if (pack.data.length != 2) return false;
-            int p = ((pack.data[0] & 0xFF) << 8) | (pack.data[1] & 0xFF);
-            int s;
-            if (soc.data.length == 2) s = ((soc.data[0] & 0xFF) << 8) | (soc.data[1] & 0xFF);
-            else if (soc.data.length == 1) s = soc.data[0] & 0xFF;
-            else return false;
-            // SOC: tenths in two bytes (0..1000) or halves in one (0..200). Pack
-            // volts: raw 800..9000. At 0.1 V/count that is 80..900 V; the floor
-            // is low so the Kratos controller's 0.25 V/count (350 V = raw 1400)
-            // passes too. No Tata pack sits between 80 and 150 V, so the lower
-            // floor admits nothing new.
-            boolean socOk = soc.data.length == 2 ? s <= 1000 : s <= 200;
-            if (!socOk || p < 800 || p > 9000) return false;
-            lastSocLen = soc.data.length;
-            return true;
-        } catch (IOException e) {
-            return false;
-        }
+    /** What a reply WAS, in one phrase - never what it said. */
+    private static String outcomeOf(UdsCodec.Response r) {
+        if (r == null) return "no reply";
+        if (r.negative) return String.format(Locale.ROOT, "NRC %02X", r.nrc & 0xFF);
+        return String.format(Locale.ROOT, "positive, %d bytes", r.data == null ? 0 : r.data.length);
     }
 
     /** Read an ASCII identification DID, trimmed; null when unsupported. */
     String readIdString(String did) {
         try {
-            return asIdString(readDid(did));
+            return asIdString(readIdResponse(did));
         } catch (IOException e) {
             return null;
         }
@@ -608,25 +412,28 @@ final class ElmClient {
     }
 
     /**
-     * Does this address respond to UDS at all?
+     * One read of the controller's name at {@link BmsFields#BMS_REQUEST}, classified.
      *
-     * Any reply counts, including a negative one: an ECU that serves data DIDs
-     * but not F197 is still the right address, so proof-of-life must not require
-     * a specific DID to be supported.
+     * A refusal counts as ANSWERED: a controller that serves the data DIDs but not
+     * F197 is still the controller. Busy / pending first replies are retried by
+     * readIdResponse when the caller asks for the name afterwards.
+     *
+     * The verdict itself is {@link ConnectPlan#classify} - pure, and tested - and
+     * it needs to know whether the adapter proved itself alive at ATZ, because
+     * silence from a live adapter is the CAR's silence, not the adapter's.
      */
-    boolean respondsAtAll(String did) {
-        try {
-            String text = raw("22" + did, 1500);
-            return text != null && !text.trim().isEmpty()
-                    && UdsCodec.reassemble(text, idLen).containsKey(responseId);
-        } catch (IOException e) {
-            return false;
+    ConnectPlan.Probe probeBms() throws IOException {
+        target(BmsFields.BMS_REQUEST);
+        boolean alive = !caps.banner().isEmpty();
+        String text = raw("22" + BmsFields.DID_SYSTEM_NAME, 1500);
+        if ((text == null || text.trim().isEmpty()) && alive) {
+            // The adapter is alive, so give the car the window the session
+            // request gets before calling it silent: a slow clone prints NO DATA
+            // only after its own timeout, and 1.5 s is inside it.
+            text = raw("22" + BmsFields.DID_SYSTEM_NAME, 4000);
         }
-    }
-
-    /** Lets the UI show which address is being probed during detection. */
-    interface ProgressSink {
-        void onProgress(String message);
+        boolean uds = text != null && UdsCodec.decode22(text, responseId) != null;
+        return ConnectPlan.classify(alive, text, uds);
     }
 
     void target(String requestHeader) throws IOException {
@@ -643,19 +450,13 @@ final class ElmClient {
         // there is nothing for the software id filter to filter. ATCM/ATCF have
         // been in the ELM327 since v1.0 and do the same job one level down.
         if (!caps.supports("ATCRA")) {
-            at("ATCM" + (responseId.length() == 8 ? "1FFFFFFF" : "7FF"), 2000);
+            at("ATCM7FF", 2000);
             at("ATCF" + responseId, 2000);
         }
     }
 
-    /** 29-bit ids go out as priority byte + 24-bit header: the form every ELM327 accepts. */
     private void setHeader(String id) throws IOException {
-        if (id.length() == 8) {
-            at("ATCP" + id.substring(0, 2), 2000);
-            at("ATSH" + id.substring(2), 2000);
-        } else {
-            at("ATSH" + id, 2000);
-        }
+        at("ATSH" + id, 2000);
     }
 
     /** The CAN id this session's target replies on; used to validate replies. */
@@ -736,7 +537,7 @@ final class ElmClient {
 
         // raw() returns "" on a silent link rather than throwing, so distinguish
         // "nothing came back" from "the ECU replied but we cannot split it".
-        java.util.Map<String, byte[]> frames = UdsCodec.reassemble(text, idLen);
+        java.util.Map<String, byte[]> frames = UdsCodec.reassemble(text);
         byte[] payload = frames.get(responseId);
         if (payload == null) {
             throw new SilentException("no reply to batched read");
@@ -775,7 +576,7 @@ final class ElmClient {
     boolean keepAlive() {
         try {
             String text = raw("3E00", 1000);
-            byte[] p = UdsCodec.reassemble(text, idLen).get(responseId);
+            byte[] p = UdsCodec.reassemble(text).get(responseId);
             // A lapsed session still answers 3E00 - the default session supports
             // it - so this is not a session-lapse detector. It catches the ECU
             // going quiet or refusing, which is the case that leaves the session

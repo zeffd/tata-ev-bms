@@ -10,9 +10,9 @@ import java.util.Locale;
  *
  * The first "works on your car, not on mine" report was the same model with a
  * different dongle. A clone that rejects the receive-filter or flow-control
- * commands can make a healthy car read as silent, and nothing in the detection
- * report used to say so. This record goes at the top of both shareable reports,
- * so support starts from the adapter rather than the car. Pure Java; ElmClient
+ * commands can make a healthy car read as silent, and nothing in the shared
+ * evidence used to say so. This record goes at the top of the poll report, so
+ * support starts from the adapter rather than the car. Pure Java; ElmClient
  * feeds it, nothing here touches the wire.
  */
 final class AdapterCaps {
@@ -58,15 +58,15 @@ final class AdapterCaps {
     }
 
     /**
-     * "ATSH785" and "ATSH18DA96F1" are one capability, ATSH; so are ATCRA with
-     * and without an id. Protocol selections stay distinct: an adapter can know
-     * ATSP6 and not ATTP7.
+     * "ATSH785" and "ATSH 785" are one capability, ATSH; so are ATCRA with and
+     * without an id. Protocol selections stay distinct: an adapter can know one
+     * protocol-select command and refuse another.
      */
     static String family(String cmd) {
         String c = cmd == null ? "" : cmd.replace(" ", "").toUpperCase(Locale.ROOT);
-        // ATCRA before ATCP, ATCM and ATCF: none of them is a prefix of another,
+        // ATCRA before ATCM and ATCF: none of them is a prefix of another,
         // but the order makes that independent of how the array is written.
-        for (String p : new String[]{"ATSH", "ATCRA", "ATFCSH", "ATCP", "ATCM", "ATCF"}) {
+        for (String p : new String[]{"ATSH", "ATCRA", "ATFCSH", "ATCM", "ATCF"}) {
             if (c.startsWith(p)) return p;
         }
         return c;
@@ -100,7 +100,14 @@ final class AdapterCaps {
             sb.append("Adapter rejected: none\n");
             return sb.toString();
         }
-        sb.append("Adapter rejected: ").append(String.join(", ", rejected)).append('\n');
+        // Not String.join: that is API 26 and minSdk is 24 (and this class is pure
+        // Java anyway, so android.text.TextUtils is not available here either).
+        StringBuilder list = new StringBuilder();
+        for (String r : rejected) {
+            if (list.length() > 0) list.append(", ");
+            list.append(r);
+        }
+        sb.append("Adapter rejected: ").append(list).append('\n');
         if (!supports("ATCRA")) {
             sb.append("  no receive filter: replies are filtered in software\n");
         }

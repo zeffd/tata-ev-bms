@@ -35,6 +35,7 @@ final class DidScanner {
 
         /** Parsed once: first() is called from an O(n^3) hypothesis search. */
         private final int firstValue;
+        private final int secondValue;
 
         Hit(String did, int length, String firstHex, String secondHex) {
             this.did = did;
@@ -42,6 +43,11 @@ final class DidScanner {
             this.firstHex = firstHex;
             this.secondHex = secondHex;
             this.firstValue = valueOf(firstHex);
+            // No second sample means no evidence of movement, which is what
+            // changed() already says about the same DID - so second() reads as
+            // the first value rather than as a swing of the whole range, or a
+            // failed re-read would disqualify every steadiness test below.
+            this.secondValue = secondHex == null ? this.firstValue : valueOf(secondHex);
         }
 
         boolean changed() {
@@ -58,6 +64,10 @@ final class DidScanner {
 
         int first() {
             return firstValue;
+        }
+
+        int second() {
+            return secondValue;
         }
     }
 
@@ -271,13 +281,50 @@ final class DidScanner {
             if (!tries.contains(f.did)) tries.add(f.did);
         }
         for (String did : tries) {
-            UdsCodec.Response r = safeRead(elm, did);
+            UdsCodec.Response r = probeRead(elm, did);
             if (r != null && r.isData()) return did;
         }
         return null;
     }
 
+    /** Pause before re-asking a DID that answered "busy"; short, since a sweep is long. */
+    private static final long BUSY_RETRY_PAUSE_MS = 150;
+
     private UdsCodec.Response safeRead(ElmClient elm, String did) {
+        try {
+            UdsCodec.Response r = elm.readDid(did);
+            ioErrorRun = 0;
+            // ONE retry, not the three an identification read gets: a sweep visits
+            // hundreds of DIDs and most silence out here is a genuine absence, so
+            // paying 150 ms per absent DID would add minutes. But a DID that was
+            // merely BUSY used to be recorded as absent - or, on the second
+            // sample, as "unchanged" - and a busy answer is not an answer.
+            //
+            // A read that THREW is not retried: that is the socket, not the ECU,
+            // and countIoError is already counting toward a declared link loss.
+            if (UdsCodec.isTransientNegative(r)) {
+                try {
+                    Thread.sleep(BUSY_RETRY_PAUSE_MS);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return r;
+                }
+                r = elm.readDid(did);
+            }
+            return r;
+        } catch (IOException e) {
+            countIoError();
+            return null;
+        }
+    }
+
+    /**
+     * One read, no retry: the anchor pre-filter, where silence is the NORMAL
+     * answer and there are ~35 other candidates to try. Retrying here would add
+     * five seconds to the start of every scan and prove nothing - a busy anchor
+     * candidate simply means the next one gets its turn.
+     */
+    private UdsCodec.Response probeRead(ElmClient elm, String did) {
         try {
             UdsCodec.Response r = elm.readDid(did);
             ioErrorRun = 0;
@@ -303,8 +350,8 @@ final class DidScanner {
      * coherent readings and let a human pick the one that matches their car.
      *
      * Cells come in two units. The Gotion controller serves millivolts; the
-     * TacoGotion one, and the Tiago's VECU mirror of it, serve 10 mV counts
-     * (325 = 3.25 V). Either way a cell must land in 2.0-4.5 V - the gate that
+     * TacoGotion one serves 10 mV counts (325 = 3.25 V). Either way a cell
+     * must land in 2.0-4.5 V - the gate that
      * keeps a constant 5000 placeholder from being offered as a cell.
      */
     static final class VoltageHypothesis {
@@ -324,8 +371,8 @@ final class DidScanner {
          * The two cell DIDs sit within two codes of each other.
          *
          * Every controller this app has seen lays the pair out that way -
-         * 3415/3417 on the Gotion, 3477/3478 on the Tiago's mirror, 3017/3018
-         * on the $30xx family - because they are neighbouring signals in one
+         * 3415/3417 on the Gotion, 3017/3018 on the $30xx family - because
+         * they are neighbouring signals in one
          * catalog block. A coincidental pairing with an unrelated DID (a SOC in
          * tenths reading 330 next to cells reading 331 and 330) is not adjacent,
          * so this is what ranks the real pair above readings that are MORE
@@ -612,6 +659,32 @@ final class DidScanner {
         return out;
     }
 
+    /** An SOC does not jump by more than this between two samples seconds apart. */
+    static boolean socSwingOk(Hit h, int maxSwing) {
+        return Math.abs(h.first() - h.second()) <= maxSwing;
+    }
+
+    /**
+     * The least a tenths SOC can read given what the cells say: an LFP cell at
+     * or above 3.20 V is on its plateau and never below ~10 %. 0 when the scan
+     * found no coherent pack reading to judge by.
+     *
+     * THIS IS A CHEMISTRY RULE, not a general one. It holds for the LFP packs
+     * this app's field evidence comes from, whose voltage barely moves between
+     * 20 % and 90 % and which therefore cannot read 3.25 V at 8 %. An NMC pack
+     * sits near 3.4 V per cell when nearly empty, so on one of those a genuine
+     * single-digit tenths SOC would be withheld here (and offered instead by the
+     * picker as a whole percent - the mislabelled twin of the truth). A different
+     * floor per chemistry is the fix when a non-LFP Tata pack turns up; until one
+     * does, there is nothing to calibrate it against.
+     */
+    static int socFloorTenths(List<VoltageHypothesis> vh) {
+        if (vh == null || vh.isEmpty()) return 0;
+        VoltageHypothesis top = vh.get(0);
+        double meanV = (top.cellMaxVolts + top.cellMinVolts) / 2.0;
+        return meanV >= 3.20 ? 100 : 0;
+    }
+
     /** As {@link #suggest(List)}, reusing hypotheses already computed. */
     static Map<String, String> suggest(List<Hit> hits, List<VoltageHypothesis> vh) {
         Map<String, String> out = new LinkedHashMap<>();
@@ -630,9 +703,16 @@ final class DidScanner {
         }
 
         // SOC moves; SOH sits still and reads high. Both are u16 tenths of a percent.
+        //
+        // "The first 2-byte value that moved" is not enough on its own: one
+        // scanned controller answered 34E4 = 5 (0.5 %) on a pack whose cells read
+        // 3.31 V, and 3537, which fell 29 counts between the two samples. A
+        // charge the cells rule out, and a value that cannot settle for the
+        // seconds between two reads, are both something else entirely.
+        int floor = Math.max(1, socFloorTenths(vh));
         Hit soc = null, soh = null;
         for (Hit h : pct) {
-            if (h.changed() && h.first() > 0 && soc == null) soc = h;
+            if (h.changed() && h.first() >= floor && socSwingOk(h, 20) && soc == null) soc = h;
         }
         for (Hit h : pct) {
             if (h == soc) continue;
@@ -735,6 +815,9 @@ final class DidScanner {
             int v = h.first();
             if (v < 0 || v > 100 || h.length > 2) continue;
             if (taken.contains(h.did) || cellBand10(h) || packBand(h)) continue;
+            // A whole percent that moved 5 points between two reads seconds
+            // apart is a counter or a status word, not a state of charge.
+            if (!socSwingOk(h, 5)) continue;
             out.add(h);
         }
         Collections.sort(out, (x, y) -> {
@@ -776,10 +859,108 @@ final class DidScanner {
             if (h.length != 2 || v <= 100 || v > 1000) continue;
             if (!excluded.contains(h.did) || taken.contains(h.did)) continue;
             if (!h.changed()) continue;
+            if (!socSwingOk(h, 20)) continue;      // 2 % in seconds: not a charge
             out.add(h);
         }
         Collections.sort(out, (x, y) -> x.did.compareTo(y.did));
         return out.size() > 12 ? new ArrayList<>(out.subList(0, 12)) : out;
+    }
+
+    /**
+     * DID -> the role reading it, for every role except those being set.
+     *
+     * A null value means the role is switched off on this car (see
+     * BmsFields.DISABLED): it reads nothing, so it owns no DID and blocks nothing.
+     */
+    private static Map<String, String> ownerByDid(Map<String, String> effective,
+                                                  java.util.Set<String> exclude) {
+        Map<String, String> owner = new java.util.HashMap<>();
+        if (effective == null) return owner;
+        for (Map.Entry<String, String> e : effective.entrySet()) {
+            if (exclude != null && exclude.contains(e.getKey())) continue;
+            if (e.getValue() == null || e.getValue().isEmpty()) continue;
+            owner.put(e.getValue().toUpperCase(Locale.ROOT), e.getKey());
+        }
+        return owner;
+    }
+
+    /**
+     * What applying a pick would take, and what it would cost.
+     *
+     * A DID can only be read as one role, so a pick landing on a DID another role
+     * already uses has to displace it - or be refused. Which of the two depends
+     * on what that other role IS: a tile the owner reads is never switched off
+     * behind their back, while a logged-only role (a busbar voltage, a rating)
+     * can step aside so the reading that actually needs the code can be mapped.
+     */
+    static final class ApplyPlan {
+        /** Role -> DID to write; empty when the pick was refused. */
+        final Map<String, String> apply;
+        /** Roles to mark BmsFields.DISABLED, in the order they were met. */
+        final List<String> disable;
+        /** Why the pick cannot be applied at all, or null. */
+        final String refusal;
+
+        ApplyPlan(Map<String, String> apply, List<String> disable, String refusal) {
+            this.apply = Collections.unmodifiableMap(apply);
+            this.disable = Collections.unmodifiableList(disable);
+            this.refusal = refusal;
+        }
+    }
+
+    static ApplyPlan planApply(Map<String, String> wanted, Map<String, String> effectiveOthers) {
+        Map<String, String> apply = new LinkedHashMap<>();
+        List<String> disable = new ArrayList<>();
+        if (wanted == null) return new ApplyPlan(apply, disable, null);
+        Map<String, String> owner = ownerByDid(effectiveOthers, wanted.keySet());
+        for (Map.Entry<String, String> e : wanted.entrySet()) {
+            String did = e.getValue() == null ? "" : e.getValue().toUpperCase(Locale.ROOT);
+            String other = owner.get(did);
+            if (other == null) continue;
+            BmsFields.Field of = BmsFields.byKey(other);
+            if (of == null || of.primary) {
+                String label = of == null ? other : of.label;
+                return new ApplyPlan(new LinkedHashMap<String, String>(),
+                        new ArrayList<String>(),
+                        did + " is already read as " + label + " (" + other + "), which is a "
+                                + "tile on the dashboard. Map that tile elsewhere first.");
+            }
+            if (!disable.contains(other)) disable.add(other);
+        }
+        apply.putAll(wanted);
+        return new ApplyPlan(apply, disable, null);
+    }
+
+    /**
+     * Drop every wanted role whose DID is already another role's in force.
+     * suggest() can name a DID that an earlier pick already gave to a
+     * different role (3421 as SOH on a car where it is SOC); refusing the
+     * whole apply for that used to block mapping the temperatures.
+     */
+    static Map<String, String> withoutClashes(Map<String, String> wanted,
+                                              Map<String, String> effectiveOthers,
+                                              List<String> skippedOut) {
+        Map<String, String> kept = new LinkedHashMap<>();
+        if (wanted == null) return kept;
+        Map<String, String> owner = new java.util.HashMap<>();
+        if (effectiveOthers != null) {
+            for (Map.Entry<String, String> e : effectiveOthers.entrySet()) {
+                if (e.getValue() != null && !e.getValue().isEmpty()
+                        && !wanted.containsKey(e.getKey())) {
+                    owner.put(e.getValue().toUpperCase(Locale.ROOT), e.getKey());
+                }
+            }
+        }
+        for (Map.Entry<String, String> e : wanted.entrySet()) {
+            String did = e.getValue() == null ? "" : e.getValue().toUpperCase(Locale.ROOT);
+            String other = owner.get(did);
+            if (other != null) {
+                if (skippedOut != null) skippedOut.add(e.getKey() + " -> " + did + " (already " + other + ")");
+                continue;
+            }
+            kept.put(e.getKey(), e.getValue());
+        }
+        return kept;
     }
 
     /**

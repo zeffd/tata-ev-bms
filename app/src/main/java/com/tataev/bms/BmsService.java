@@ -80,7 +80,7 @@ public final class BmsService extends Service {
     static final String EXTRA_ALERT = "alert";
 
     /** Connection/poll state, published for the UI. */
-    enum State { IDLE, CONNECTING, DETECTING, RUNNING, ERROR }
+    enum State { IDLE, CONNECTING, RUNNING, ERROR }
 
     private static volatile Reading latestReading;
     /**
@@ -113,13 +113,20 @@ public final class BmsService extends Service {
 
     /**
      * A failure the dashboard can offer a fix for, right where it is reported.
-     * NO_BMS: nothing at any candidate address called itself a battery - the
-     * user may know the address. UNMAPPED: the BMS answered but none of the
-     * known codes decoded - this model needs mapping.
+     * NO_BMS: the battery controller at 785 did not reply on two connects - the
+     * car is off or this is not a Tata EV. UNMAPPED: the BMS answered but none
+     * of the known codes decoded - this model needs mapping.
      */
     enum Trouble { NONE, NO_BMS, UNMAPPED }
 
     private static volatile Trouble trouble = Trouble.NONE;
+    /**
+     * The last transcript written, or null - by a poll that decoded nothing, or
+     * by a connect that never reached the controller. Offered on the trouble card
+     * and cleared as soon as a poll decodes something, so a stale one is never
+     * offered beside live numbers.
+     */
+    private static volatile String pollReportPath;
     /**
      * What this session has learned about individual cell groups.
      *
@@ -196,21 +203,12 @@ public final class BmsService extends Service {
         return deltaLimitMv;
     }
 
+    static String pollReportPath() {
+        return pollReportPath;
+    }
+
     static Trouble trouble() {
         return trouble;
-    }
-
-    /** ECUs the broadcast probe heard that were not identified; "" when none. */
-    private static volatile String discoveredEcus = "";
-    /** Path of the last saved detection report, or null. */
-    private static volatile String detectReportPath;
-
-    static String discoveredEcus() {
-        return discoveredEcus;
-    }
-
-    static String detectReportPath() {
-        return detectReportPath;
     }
 
     static double actualPeriodS() {
@@ -277,11 +275,15 @@ public final class BmsService extends Service {
     private int emptyPolls;
     /** Consecutive polls the ECU answered without producing a single known value. */
     private int unmappedPolls;
-    /** Cleared once a saved BMS address proves itself; drives re-detection. */
-    private int badAddressStreak;
     /** Multi-DID reads are assumed to work until this ECU proves otherwise. */
     private boolean batchingWorks = true;
     private int batchFailures;
+    /** Batches that got silence where the same DIDs answered one at a time. */
+    private int silentBatches;
+    /** role=DID for everything the last poll asked for, for the poll report. */
+    private List<String> lastResolvedRoles = new ArrayList<>();
+    /** The request id this connect is polling, for the poll report. */
+    private String activeTarget = "";
     private long lastKeepAliveMs;
     /** Previous successful poll, for the achieved-cadence readout. */
     private long lastSampleMs;
@@ -312,8 +314,8 @@ public final class BmsService extends Service {
     /** Kept so the give-up message can say WHY, not just that it gave up. */
     private String lastFailureReason = "no response from the adapter";
     private static final int MAX_CONNECT_FAILURES = 12;   // ~1 minute of retries
-    /** Detection sweeps in a row where no address answered at all. */
-    private int silentSweeps;
+    /** Connects in a row where 785 gave no reply. */
+    private int silentConnects;
 
     @Override
     public void onCreate() {
@@ -541,7 +543,7 @@ public final class BmsService extends Service {
 
     /** "... - retrying" reads badly nested inside "Could not connect - ...". */
     private static String withoutRetrySuffix(String s) {
-        String[] tails = {" - retrying", " - reconnecting", " - will re-detect"};
+        String[] tails = {" - retrying", " - reconnecting"};
         for (String tail : tails) {
             if (s.endsWith(tail)) return s.substring(0, s.length() - tail.length());
         }
@@ -553,6 +555,7 @@ public final class BmsService extends Service {
         // A trouble from an earlier attempt must not sit under an unrelated
         // failure on this one; the card follows whatever THIS attempt hit.
         trouble = Trouble.NONE;
+        pollReportPath = null;      // this link's evidence, not the last one's
         try {
             BluetoothAdapter adapter = bluetoothAdapter();
             if (adapter == null || !adapter.isEnabled()) {
@@ -577,218 +580,57 @@ public final class BmsService extends Service {
             // connect() can block for 5-20 s; the user may well be gone by now.
             if (destroyed || !running) return false;
 
-            String configured = prefs.bmsRequestId();
-            String bmsAddress = configured;
-            ElmClient.BmsInfo found = null;
-            boolean pinned = configured != null && !configured.isEmpty();
-            if (pinned) {
-                // Open the saved address on the protocol it was found on. A 29-bit
-                // address saved before protocols were persisted still opens on
-                // ATTP7 by its shape, and one saved under the older persisting
-                // name (ATSP7/8/9) resolves to the same rung's ATTP form.
-                client.useProtocol(ProtocolLadder.atspForId(configured, prefs.bmsProtocol()));
-                client.initAndTargetBms(configured);
-                // ATSH/ATCRA are adapter-local and always answer OK, so a saved
-                // address must be confirmed against a real read or a stale one
-                // loops forever without ever re-detecting.
-                // Any UDS reply proves the address is right - even a negative
-                // one. Requiring F197 to be SUPPORTED would reject a BMS that
-                // serves data DIDs but not that identification DID.
-                //
-                // Ask for the DID this vehicle actually uses, not the Nexon
-                // default. On an ECU that answers NRC 0x31 for an unsupported DID
-                // the choice does not matter - a negative reply still proves the
-                // address. On one that simply stays SILENT for a DID it does not
-                // serve, asking for the hardcoded 3402 on a model remapped away
-                // from it fails a perfectly good address; if it was auto-detected
-                // it is then discarded and re-detection starts over, and if the
-                // user typed it the connect retries forever. Exactly the remapped
-                // vehicle Scan exists to support.
-                boolean alive = client.respondsAtAll(BmsFields.DID_SYSTEM_NAME)
-                        || client.respondsAtAll(
-                                BmsFields.effectiveDid(BmsFields.ALL.get(0), prefs));
-                if (alive) {
-                    badAddressStreak = 0;
-                    if (!destroyed) bmsInfoText = "BMS " + configured + " (from settings)";
-                } else if (++badAddressStreak < 2) {
-                    fail("BMS " + configured + " not answering - retrying");
-                    client.close();
-                    return false;
-                } else {
-                    // Two misses: look for the battery controller elsewhere on
-                    // this link rather than retry one address for the whole
-                    // budget. An auto-detected address is forgotten. One the
-                    // user typed stays saved on this profile - it is the only
-                    // way to pin an ECU detection cannot find - because the
-                    // likeliest reason it fails is that a DIFFERENT car is
-                    // plugged in today: detection finds that car's controller
-                    // and identifyVehicle switches to its profile.
-                    badAddressStreak = 0;
-                    if (!prefs.bmsRequestIdIsUserEntered()) prefs.setBmsRequestId("");
-                    pinned = false;
-                }
+            setState(State.CONNECTING, "Checking the battery controller at "
+                    + BmsFields.BMS_REQUEST + "...");
+            publish(null);
+            client.initAdapter();
+            // Set before the probe, not after it: this is the address being
+            // asked, so a poll report written from a FAILED connect names it
+            // too - it used to be blank on the first connect of a session.
+            activeTarget = BmsFields.BMS_REQUEST;
+            ConnectPlan.Probe probe = client.probeBms();
+            if (probe == ConnectPlan.Probe.ADAPTER_SILENT) {
+                // Written BEFORE the close, while the client still holds the
+                // transcript and the adapter's own refusals: "nothing came back"
+                // is the outcome a screenshot of one sentence cannot explain, and
+                // which of the three causes it was lives in this file.
+                savePollReport(client, BmsFields.MSG_ADAPTER_SILENT);
+                client.close();
+                fail(BmsFields.MSG_ADAPTER_SILENT);
+                return false;
             }
-            if (!pinned) {
-                // The ladder. Today's behaviour is the first rung and runs
-                // unchanged; every later rung only fires after the one before it
-                // heard nothing battery-shaped. The 29-bit rungs try the
-                // addresses Tata's own catalogs use before asking the bus.
-                String heardElsewhere = "";
-                // Across ALL rungs: sweepCandidates() resets lastDetectAnswered on
-                // every call, so the last rung alone would call a Tiago whose VECU
-                // answered on rung 1 "a silent car".
-                int answeredTotal = 0;
-                boolean heardAnything = false;
-                boolean first = true;
-                ElmClient.ProgressSink sink = msg -> {
-                    // The 10-minute lease is otherwise renewed only once
-                    // establish() returns, and a four-rung ladder with a sweep
-                    // budget per rung plus broadcast discovery can approach it.
-                    // Every probed address ticks this, so the phone cannot doze
-                    // mid-detection and leave a half-open link behind.
-                    refreshWakeLock();
-                    setState(State.DETECTING, msg);
-                    publish(null);
-                };
-                for (ProtocolLadder.Rung rung : ProtocolLadder.rungs()) {
-                    if (destroyed || !running) return false;
-                    // A 250 kbaud probe on a live 500 kbaud bus puts error frames
-                    // on the diagnostic bus until the adapter goes bus-off, and
-                    // ECUs may log it. Those rungs are for a bus that said NOTHING.
-                    //
-                    // "Nothing" on the FIRST sweep is most often a car that is
-                    // simply not awake yet - the owner opens the app before
-                    // switching on, which auto-connect makes routine - and a
-                    // sleeping 500 kbaud Nexon looks identical to a 250 kbaud
-                    // car. So the first attempt never goes to 250 kbaud; the
-                    // retry does. silentSweeps is 0 on the first pass and 1 on
-                    // the retry (it is incremented after this loop), which is
-                    // exactly the distinction needed.
-                    boolean is250k = "ATTP8".equals(rung.atsp) || "ATTP9".equals(rung.atsp);
-                    if (is250k && (answeredTotal > 0 || heardAnything || silentSweeps == 0)) {
-                        client.noteInLog("--- " + rung.name + ": skipped, "
-                                + (silentSweeps == 0 && answeredTotal == 0 && !heardAnything
-                                        ? "deferred to the retry - a car that is not awake yet "
-                                          + "looks the same as a 250 kbaud one"
-                                        : "the bus already answered at 500 kbaud")
-                                + " ---");
-                        continue;
-                    }
-                    setState(State.DETECTING, "Locating BMS (" + rung.name + ")...");
-                    publish(null);
-                    if (first) {
-                        client.useProtocol(rung.atsp);
-                        found = client.detectBms(rung.candidates, sink);   // runs initAdapter
-                        first = false;
-                    } else {
-                        client.noteInLog("--- " + rung.name + " ---");
-                        client.switchProtocol(rung.atsp);
-                        // A stripped clone can know ATSP6 and not ATTP7. Sweeping
-                        // anyway probes 29-bit addresses while the link is still
-                        // 11-bit 500 kbaud: it cannot find anything, and an empty
-                        // sweep in the transcript reads as "the car is silent"
-                        // rather than "the adapter would not go there".
-                        if (!client.caps().supports(rung.atsp)) {
-                            client.noteInLog("--- " + rung.name + ": skipped, adapter refused "
-                                    + rung.atsp + " ---");
-                            continue;
-                        }
-                        found = client.sweepCandidates(rung.candidates, sink);
-                    }
-                    answeredTotal += client.lastDetectAnswered();
-                    if (found != null) break;
-                    // Ask the WHOLE bus who is there at this rung before moving
-                    // on. A model whose BMS lives at an address this app has never
-                    // seen is found this way instead of dead-ending at a typed-
-                    // address card the owner cannot fill in.
-                    setState(State.DETECTING, "Asking every ECU on the bus (" + rung.name + ")...");
-                    publish(null);
-                    java.util.List<String> extra = client.discoverEcus(rung.functional);
-                    if (!extra.isEmpty()) heardAnything = true;
-                    extra.removeAll(rung.candidates);
-                    if (!extra.isEmpty()) {
-                        found = client.sweepCandidates(extra, sink);
-                        answeredTotal += client.lastDetectAnswered();
-                        if (found != null) break;
-                        heardElsewhere = String.join(", ", extra) + " (" + rung.name + ")";
-                    }
-                }
-                discoveredEcus = found != null ? "" : heardElsewhere;
-                if (found == null) {
-                    client.close();
-                    boolean carSilent = answeredTotal == 0 && !heardAnything;
-                    if (carSilent && ++silentSweeps < 2) {
-                        // Nothing answered anywhere on any rung: an asleep or
-                        // switched-off car looks exactly like this. One more try.
-                        fail("No answer from the car at any address - is it switched on? Retrying");
-                        return false;
-                    }
-                    silentSweeps = 0;
-                    trouble = Trouble.NO_BMS;
-                    detectReportPath = saveDetectReport(
-                            client.caps().report() + "App: " + CsvLogger.appVersion(this) + "\n",
-                            client.detectionLog());
-                    fatal(carSilent
-                            ? "No answer from the car at any address this app knows"
-                            : "Could not find a battery controller on this vehicle");
+            if (probe == ConnectPlan.Probe.NO_REPLY) {
+                savePollReport(client, BmsFields.MSG_NO_REPLY);
+                client.close();
+                if (++silentConnects < 2) {
+                    // A car that is not awake yet looks exactly like this; the
+                    // owner opens the app before switching on. One more try.
+                    // The tail is the one withoutRetrySuffix strips, so the
+                    // give-up line cannot read "...switched on? - retrying".
+                    fail(BmsFields.MSG_NO_REPLY + " - retrying");
                     return false;
                 }
-                silentSweeps = 0;
-                // detectBms already ran initAdapter(); repeating it here would be a
-                // second ATZ hardware reset that discards the protocol just chosen.
-                client.targetAndOpenSession(found.requestId);
-                // NOT persisted here: identifyVehicle below may switch profiles.
-                bmsAddress = found.requestId;
-                if (!destroyed) {
-                    String proto = "ATSP6".equals(found.protocol) ? ""
-                            : "  " + ProtocolLadder.forProtocol(found.protocol).name;
-                    bmsInfoText = "BMS " + found.requestId + "/" + found.responseId + proto
-                            + "  " + found.systemName
-                            + (found.supplier == null || found.supplier.isEmpty()
-                            ? "" : " (" + found.supplier + ")");
-                }
+                silentConnects = 0;
+                trouble = Trouble.NO_BMS;
+                fatal(BmsFields.MSG_NO_REPLY);
+                return false;
             }
-
-            final boolean resolved = identifyVehicle(client, bmsAddress);
-
-            // A $30xx-dialect controller: load its catalog's DIDs and scales as a
-            // preset - once, and only into a profile this connect actually
-            // identified, with nothing mapped by hand on it. ProfileMatch
-            // .mayApplyPreset holds that rule (and says why); the whole gate runs
-            // inside commitIfActiveProfile so a profile switch on another thread
-            // cannot redirect fourteen DID writes into another car's record.
-            if (found != null && "30xx".equals(found.dialect)) {
-                final Presets.Preset p =
-                        Presets.identify30xx(client.lastSocLen(), client.lastIdxLen());
-                if (p != null) {
-                    final boolean[] applied = { false };
-                    // The return value is the THIRD reason a preset can be
-                    // skipped: the active profile changed between reading it
-                    // here and taking the monitor, so nothing was written. The
-                    // behaviour is right either way (fail-safe: no write), but a
-                    // log line blaming "already mapped" for a profile switch
-                    // sends the next support case looking in the wrong place.
-                    boolean sameProfile = prefs.commitIfActiveProfile(prefs.activeProfile(), () -> {
-                        if (!ProfileMatch.mayApplyPreset(resolved, prefs.hasAnyOverride())) return;
-                        applyPreset(p);
-                        applied[0] = true;
-                    });
-                    if (applied[0]) {
-                        Log.i(TAG, "applied battery map preset " + p.name);
-                        if (!destroyed) bmsInfoText = bmsInfoText + "  ·  " + p.name;
-                    } else {
-                        Log.i(TAG, "preset " + p.name + " NOT applied: "
-                                + (!sameProfile ? "profile switched during identification"
-                                        : resolved ? "profile already mapped"
-                                        : "profile unconfirmed"));
-                    }
-                }
+            silentConnects = 0;
+            client.enterExtendedSession();
+            String name = client.readIdString(BmsFields.DID_SYSTEM_NAME);
+            String supplier = name == null ? null : client.readIdString(BmsFields.DID_SUPPLIER);
+            if (!destroyed) {
+                bmsInfoText = "BMS " + BmsFields.BMS_REQUEST + "/" + client.responseId()
+                        + (name == null || name.isEmpty() ? "" : "  " + name)
+                        + (supplier == null || supplier.isEmpty() ? "" : " (" + supplier + ")");
             }
+            identifyVehicle(client);
 
             // A new link may be a different vehicle or adapter, so give the
             // batching optimisation another chance rather than staying latched off.
             batchingWorks = true;
             batchFailures = 0;
+            silentBatches = 0;
             alerter.reset();          // a new link starts the alert windows over
             zeroCheck.reset();
             calibrationHint = "";
@@ -828,8 +670,6 @@ public final class BmsService extends Service {
                 }
             }
             trouble = Trouble.NONE;       // whatever went wrong before, this link works
-            discoveredEcus = "";
-            detectReportPath = null;
             setState(State.RUNNING, "Connected");
             publish(null);
             return true;
@@ -854,17 +694,21 @@ public final class BmsService extends Service {
      * readable the active profile simply stays, because churning profiles on a
      * bad link would scatter one car's calibration across several records.
      *
-     * @return whether the active profile is now RESOLVED to the connected car.
-     *         False only on the unresolved path below - VIN-keyed profile, no
-     *         VIN read - where nothing was attached and the caller must not
-     *         write per-vehicle data either (see ProfileMatch.mayApplyPreset).
+     * On the unresolved path below - VIN-keyed profile, no VIN read - nothing is
+     * attached at all, because this may not be that profile's car.
      */
-    private boolean identifyVehicle(ElmClient client, String bmsAddress) {
+    private void identifyVehicle(ElmClient client) {
         String vin = ProfileMatch.extractVin(client.readIdString(BmsFields.DID_VIN));
+        // The OUTCOME, never the value: which of "refused", "timed out" and
+        // "answered" happened is the whole diagnosis when a profile will not bind.
+        Log.i(TAG, "VIN read: " + client.lastVinReadOutcome());
         boolean byVin = !vin.isEmpty();
         int active = prefs.activeProfile();
+        // The serial read happens only on the VIN-less branch: a ternary does not
+        // evaluate the arm it does not take, so a car that served its VIN adds no
+        // request to the wire.
         String id = byVin ? vin
-                : ProfileMatch.fingerprint(bmsAddress,
+                : ProfileMatch.fingerprint(client.readIdString(BmsFields.DID_SERIAL),
                         client.readIdString(BmsFields.DID_SUPPLIER));
         boolean unresolved = false;
         if (!byVin && !prefs.profileVin(active).isEmpty()) {
@@ -904,34 +748,41 @@ public final class BmsService extends Service {
                     ? "Tata EV · " + vin.substring(vin.length() - 4)
                     : "Vehicle " + now);
         }
-        // The address that just worked belongs on this profile - but never
-        // overwrite one already stored (an address the user pinned on purpose
-        // would silently unpin itself), and never write ANYTHING on the
-        // unresolved path above: this may not be the profile's car at all.
-        if (!unresolved && prefs.bmsRequestId().isEmpty()) {
-            prefs.setBmsRequestId(bmsAddress);
-            prefs.setBmsProtocol(client.protocol());
-        }
         // On the unresolved path the profile's name would assert an
         // identification that did not happen; label the session honestly.
         String pn = unresolved ? "profile unconfirmed" : prefs.profileName(now);
         if (!destroyed && !pn.isEmpty()) {
             bmsInfoText = bmsInfoText + "  ·  " + pn;
         }
-        return !unresolved;
     }
 
-    /** Write a catalog preset into the active profile: DIDs, scales, current calibration. */
-    private void applyPreset(Presets.Preset p) {
-        for (Map.Entry<String, String> e : p.dids.entrySet()) {
-            prefs.setDidOverride(e.getKey(), e.getValue());
+    /**
+     * Ask a group's DIDs one at a time, decoding what answers.
+     *
+     * @return how many answered, or -1 when the link died (already reported, and
+     *         the caller must return: readDid returns null on SILENCE rather
+     *         than throwing, so an IOException here is always the socket).
+     */
+    private int readSingly(ElmClient client, List<BmsFields.Field> group, List<String> dids,
+                           Reading r, Map<String, BmsFields.Scale> scales, double scale, int zero) {
+        int answered = 0;
+        for (int j = 0; j < group.size(); j++) {
+            BmsFields.Field f = group.get(j);
+            try {
+                UdsCodec.Response resp = client.readDid(dids.get(j));
+                if (resp != null && resp.isData()) {
+                    answered++;
+                    r.raw.put(f.key, UdsCodec.toHex(resp.data));
+                    Double v = BmsFields.decode(f, resp.data, scales.get(f.key), scale, zero);
+                    if (v != null) r.values.put(f.key, v);
+                }
+            } catch (IOException e) {
+                client.close();
+                fail("Link lost - reconnecting");
+                return -1;
+            }
         }
-        for (Map.Entry<String, String> e : p.scales.entrySet()) {
-            prefs.setScaleOverride(e.getKey(), e.getValue());
-        }
-        prefs.setCurrentScale(p.currentScale);
-        prefs.setCurrentZero(p.currentZero);
-        prefs.setPresetName(p.name);
+        return answered;
     }
 
     /**
@@ -952,32 +803,40 @@ public final class BmsService extends Service {
     }
 
     /**
-     * The detection transcript, saved as a shareable file: what the adapter is
-     * and what it refused first, then address by address who answered and what
-     * it called itself.
+     * A shareable text file in the logs directory, named by prefix and time.
+     *
+     * @return its absolute path, or null when it could not be written - a failed
+     *         report must never be offered as a file that exists.
      */
-    private String saveDetectReport(String header, String log) {
+    private String saveReport(String prefix, String title, String header, String body) {
         try {
             java.io.File dir = CsvLogger.logsDir(this);
             //noinspection ResultOfMethodCallIgnored
             dir.mkdirs();
             String stamp = new java.text.SimpleDateFormat("yyyyMMdd_HHmmss",
-                    java.util.Locale.US).format(new java.util.Date());
-            java.io.File f = new java.io.File(dir, "detect_" + stamp + ".txt");
+                    Locale.ROOT).format(new java.util.Date());
+            java.io.File f = new java.io.File(dir, prefix + "_" + stamp + ".txt");
             // try-with-resources, as DidScanner.writeReport does: a write that
             // throws must still close the handle.
             try (java.io.FileWriter w = new java.io.FileWriter(f)) {
-                w.write("Tata EV BMS - detection report\n"
-                        + "No battery controller was identified. Below is every address "
-                        + "probed and what answered.\n\n");
+                w.write(title == null ? "" : title);
                 w.write(header == null ? "" : header);
-                w.write("\n");
-                w.write(log == null ? "" : log);
+                if (header != null && !header.isEmpty()) w.write("\n");
+                w.write(body == null ? "" : body);
             }
             return f.getAbsolutePath();
         } catch (java.io.IOException e) {
             return null;
         }
+    }
+
+    /** The transcript behind a poll that decoded nothing, saved to share. */
+    private void savePollReport(ElmClient client, String reason) {
+        pollReportPath = saveReport("poll", "", "",
+                PollReport.render(client.caps().report(), CsvLogger.appVersion(this),
+                        client.protocol(), activeTarget, batchingWorks,
+                        lastResolvedRoles, client.recentTraffic(), reason,
+                        client.lastVinReadOutcome(), client.lastSessionOutcome()));
     }
 
     private void pollOnce(ElmClient client) {
@@ -1022,13 +881,27 @@ public final class BmsService extends Service {
         final List<String> resolved = new ArrayList<>(wanted.size());
         final Map<String, Integer> widthByDid = new HashMap<>();
         final Map<String, BmsFields.Scale> scales = new HashMap<>();
-        for (BmsFields.Field f : wanted) {
-            String did = BmsFields.effectiveDid(f, prefs).toUpperCase(Locale.ROOT);
+        // Drops as it resolves, so wanted and resolved stay index-parallel: a role
+        // switched off on this car (BmsFields.DISABLED) has no DID to ask for, so
+        // it is not read, not decoded, and its raw CSV column stays blank.
+        for (java.util.Iterator<BmsFields.Field> it = wanted.iterator(); it.hasNext(); ) {
+            BmsFields.Field f = it.next();
+            String raw = BmsFields.effectiveDid(f, prefs);
+            if (raw == null) {
+                it.remove();
+                continue;
+            }
+            String did = raw.toUpperCase(Locale.ROOT);
             resolved.add(did);
             BmsFields.Scale s = BmsFields.scaleOf(f, prefs);
             if (s != null) scales.put(f.key, s);
-            widthByDid.put(did, BmsFields.width(f, prefs));
+            widthByDid.put(did, s == null ? BmsFields.width(f.kind) : s.width);
         }
+        List<String> askedRoles = new ArrayList<>(wanted.size());
+        for (int i = 0; i < wanted.size(); i++) {
+            askedRoles.add(wanted.get(i).key + "=" + resolved.get(i));
+        }
+        lastResolvedRoles = askedRoles;
         final UdsCodec.WidthLookup widths = did -> {
             Integer w = did == null ? null : widthByDid.get(did.toUpperCase(Locale.ROOT));
             return w == null ? -1 : w;
@@ -1058,10 +931,9 @@ public final class BmsService extends Service {
             } catch (ElmClient.SilentException e) {
                 // The socket is fine, the ECU just did not answer. Tolerated here
                 // and judged at the end of the poll: tearing the link down on one
-                // quiet moment costs a reconnect, an ATZ and a re-detect, which is
-                // far more disruptive than skipping a single sample.
+                // quiet moment costs a reconnect, an ATZ and a fresh probe of
+                // 785, which is far more disruptive than skipping a sample.
                 transportError = true;
-                silentGroups++;
             } catch (IOException e) {
                 // A real transport error - the socket is gone. Retrying the other
                 // groups would only wait out their timeouts, so reconnect now.
@@ -1070,10 +942,21 @@ public final class BmsService extends Service {
                 return;
             }
             if (transportError) {
-                // Asking a mute ECU the same three DIDs one at a time only waits
-                // out three more timeouts, so skip the fallback and let the
-                // empty-poll check below decide whether the link is really gone.
-                if (silentGroups >= 2) break;
+                // A silent BATCH is not a mute ECU. Some ECUs answer single reads
+                // and say nothing at all to a three-DID request - which used to
+                // end the group here, empty every poll,
+                // and reconnect every second poll with the dashboard reading "--"
+                // beside correct captions. Ask singly before believing silence.
+                int answered = readSingly(client, group, dids, r, scales, scale, zero);
+                if (answered < 0) return;                      // link gone, already reported
+                if (PollPlan.groupMute(true, answered)) {
+                    silentGroups++;
+                    if (silentGroups >= 2) break;
+                } else if (batchingWorks && PollPlan.dropBatching(++silentBatches)) {
+                    batchingWorks = false;
+                    Log.i(TAG, "batched reads get no reply but single reads answer; "
+                            + "using single reads");
+                }
                 continue;
             }
 
@@ -1110,23 +993,7 @@ public final class BmsService extends Service {
             }
 
             // Fallback: ask one at a time.
-            for (int j = 0; j < group.size(); j++) {
-                BmsFields.Field f = group.get(j);
-                try {
-                    UdsCodec.Response resp = client.readDid(dids.get(j));
-                    if (resp != null && resp.isData()) {
-                        r.raw.put(f.key, UdsCodec.toHex(resp.data));
-                        Double v = BmsFields.decode(f, resp.data, scales.get(f.key), scale, zero);
-                        if (v != null) r.values.put(f.key, v);
-                    }
-                } catch (IOException e) {
-                    // readDid returns null on silence rather than throwing, so
-                    // this is always a real transport error.
-                    client.close();
-                    fail("Link lost - reconnecting");
-                    return;
-                }
-            }
+            if (readSingly(client, group, dids, r, scales, scale, zero) < 0) return;
         }
 
         if (r.values.containsKey("cell_min_mv")) {
@@ -1162,9 +1029,14 @@ public final class BmsService extends Service {
                 emptyPolls++;
                 if (emptyPolls >= 2) {
                     emptyPolls = 0;
+                    String why = silentGroups > 0 ? "Link lost - reconnecting"
+                            : "No response from BMS - reconnecting";
+                    // Written BEFORE the close, while the client still holds the
+                    // transcript: two polls that came back with nothing at all is
+                    // the case a screenshot of "--" cannot explain.
+                    savePollReport(client, why);
                     client.close();
-                    fail(silentGroups > 0 ? "Link lost - reconnecting"
-                            : "No response from BMS - reconnecting");
+                    fail(why);
                 }
             } else {
                 // Debounced like the empty case, and for a sharper reason: this
@@ -1192,14 +1064,19 @@ public final class BmsService extends Service {
                     // while telling them to run it. Scan itself also refuses to
                     // start while this service is up.
                     trouble = Trouble.UNMAPPED;
-                    fatal("The battery controller answers, but not with codes this app "
-                            + "knows - this car needs mapping");
+                    String why = "The battery controller answers, but not with codes this app "
+                            + "knows - this car needs mapping";
+                    savePollReport(client, why);
+                    fatal(why);
                 }
             }
             return;
         }
         emptyPolls = 0;
         unmappedPolls = 0;
+        // Live numbers on the screen and a "nothing decoded" report beside them
+        // would be two different stories about the same link.
+        pollReportPath = null;
 
         // Carry the slow roles forward on a fast cycle - AFTER the usable check
         // above, so a carried SOC cannot make a poll whose fast batches all

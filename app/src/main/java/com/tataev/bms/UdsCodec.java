@@ -32,6 +32,22 @@ final class UdsCodec {
     }
 
     /** One decoded UDS reply. */
+    /** The ECU is busy right now. */
+    private static final int NRC_BUSY = 0x21;
+    /** The ECU has accepted the request and is still working on it. */
+    private static final int NRC_PENDING = 0x78;
+
+    /**
+     * Did this reply say "not now" rather than "no"? Silence, busyRepeatRequest
+     * and responsePending are all the ECU still thinking; the adapter's window
+     * closes before the answer lands. Every other outcome - a positive reply, or
+     * an NRC like requestOutOfRange - is final and must not be asked again.
+     */
+    static boolean isTransientNegative(Response r) {
+        if (r == null) return true;
+        return r.negative && (r.nrc == NRC_BUSY || r.nrc == NRC_PENDING);
+    }
+
     static final class Response {
         /** The CAN id this reply arrived on; kept for diagnostics and logging. */
         final String canId;
@@ -90,8 +106,14 @@ final class UdsCodec {
         return p.length >= 3 && (p[0] & 0xFF) == 0x7F && (p[2] & 0xFF) == 0x78;
     }
 
-    /** Reassemble ELM327 output into {can_id: [payload, ...]} in arrival order. */
-    static Map<String, List<byte[]>> reassembleAll(String text, int idLen) {
+    /**
+     * Reassemble ELM327 output into {can_id: [payload, ...]} in arrival order.
+     *
+     * With headers on, an 11-bit id is printed as three hex digits - the only
+     * shape this app ever sees, because 785 is the only address it targets.
+     */
+    static Map<String, List<byte[]>> reassembleAll(String text) {
+        final int idLen = 3;
         Map<String, List<byte[]>> out = new HashMap<>();
         Map<String, byte[]> partialBuf = new HashMap<>();
         Map<String, Integer> partialTotal = new HashMap<>();
@@ -194,57 +216,14 @@ final class UdsCodec {
     }
 
     /**
-     * Reassemble to one payload per CAN ID, preferring the real answer.
+     * The id an ECU replies on when asked at {@code requestId}: request + 8.
      *
-     * An ECU may reply 7F xx 78 (responsePending) and then send the actual
-     * response on the same ID; the pending frame must not mask the real one.
+     * Tata's 0x7xx block and ISO's 7E0/7E8 both follow that rule. Null when the
+     * id is not three hex digits, or when the reply would not fit 11 bits - the
+     * adapter filters on that id, so a reply above 7FF is one we could never see.
      */
-    /**
-     * Every CAN id that produced any decodable frame in this text. After a
-     * functional-broadcast probe the IDS are the whole yield - each one is an
-     * ECU announcing it exists; the payloads do not matter.
-     *
-     * @param idLen 3 for 11-bit ids, 8 for 29-bit: the adapter prints whichever
-     *              protocol is selected, and the two cannot be told apart from
-     *              the text alone.
-     */
-    static List<String> respondingIds(String text, int idLen) {
-        return new java.util.ArrayList<>(reassembleAll(text, idLen).keySet());
-    }
-
-    static List<String> respondingIds(String text) {
-        return respondingIds(text, 3);
-    }
-
-    /**
-     * The request id an ECU answering on {@code responseId} listens on.
-     *
-     * 11-bit: reply = request + 8 - Tata's 0x7xx block and ISO's 7E0/7E8 both
-     * follow it. 29-bit physical: the low two bytes are (target, source), so
-     * a reply on 18DAF196 came from a request to 18DA96F1. Null when the id is
-     * neither shape or the arithmetic leaves the usable range.
-     */
-    static String requestIdFor(String responseId) {
-        if (responseId == null) return null;
-        if (responseId.length() == 8 && CommandGuard.isHex(responseId)) {
-            return swapLowBytes(responseId);
-        }
-        try {
-            int resp = Integer.parseInt(responseId, 16);
-            int req = resp - 8;
-            if (req < 0 || req > 0x7F7) return null;
-            return String.format(java.util.Locale.ROOT, "%03X", req);
-        } catch (NumberFormatException e) {
-            return null;
-        }
-    }
-
-    /** The id an ECU replies on when asked at {@code requestId}; the inverse of the above. */
     static String responseIdFor(String requestId) {
         if (requestId == null) return null;
-        if (requestId.length() == 8 && CommandGuard.isHex(requestId)) {
-            return swapLowBytes(requestId);
-        }
         if (requestId.length() != 3 || !CommandGuard.isHex(requestId)) return null;
         int req = Integer.parseInt(requestId, 16);
         if (req + 8 > 0x7FF) return null;
@@ -253,15 +232,15 @@ final class UdsCodec {
         return String.format(java.util.Locale.ROOT, "%03X", req + 8);
     }
 
-    /** PPDAttss -> PPDAsstt: the 29-bit target/source swap. */
-    private static String swapLowBytes(String id) {
-        String up = id.toUpperCase(java.util.Locale.ROOT);
-        return up.substring(0, 4) + up.substring(6, 8) + up.substring(4, 6);
-    }
-
-    static Map<String, byte[]> reassemble(String text, int idLen) {
+    /**
+     * Reassemble to one payload per CAN ID, preferring the real answer.
+     *
+     * An ECU may reply 7F xx 78 (responsePending) and then send the actual
+     * response on the same ID; the pending frame must not mask the real one.
+     */
+    static Map<String, byte[]> reassemble(String text) {
         Map<String, byte[]> best = new HashMap<>();
-        for (Map.Entry<String, List<byte[]>> e : reassembleAll(text, idLen).entrySet()) {
+        for (Map.Entry<String, List<byte[]>> e : reassembleAll(text).entrySet()) {
             byte[] pick = null;
             for (byte[] p : e.getValue()) {
                 if (!isResponsePending(p)) pick = p;      // last real answer wins
@@ -282,12 +261,6 @@ final class UdsCodec {
     }
 
     /**
-     * Decode a service 0x22 reply arriving on {@code expectedId}.
-     *
-     * Only that exact CAN ID is accepted. Attributing some other ECU's reply to
-     * the one we asked would let BMS auto-detection latch onto the wrong address.
-     */
-    /**
      * As {@link #decode22(String, String)}, but also requires the reply to echo
      * the DID that was asked for.
      *
@@ -304,9 +277,15 @@ final class UdsCodec {
         return r;
     }
 
+    /**
+     * Decode a service 0x22 reply arriving on {@code expectedId}.
+     *
+     * Only that exact CAN ID is accepted. Attributing some other ECU's reply to
+     * the one we asked would record another controller's numbers as the battery's.
+     */
     static Response decode22(String text, String expectedId) {
         if (expectedId == null) return null;
-        byte[] payload = reassemble(text, expectedId.length()).get(expectedId);
+        byte[] payload = reassemble(text).get(expectedId);
         if (payload == null || payload.length == 0) return null;
 
         if ((payload[0] & 0xFF) == 0x7F) {

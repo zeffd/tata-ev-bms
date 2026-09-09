@@ -1,7 +1,6 @@
 package com.tataev.bms;
 
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
@@ -13,9 +12,10 @@ import java.util.Locale;
  * supplier GOTION_BMS). Tata's EV range shares an electrical architecture, so
  * the same non-standard 0x7xx diagnostic addressing and DID block are expected
  * on Tiago/Tigor/Punch/Curvv EV - but cell count and the exact DID set can
- * differ, so nothing here is assumed:
+ * differ, so nothing about the DATA is assumed:
  *
- *   * the BMS address is auto-detected by probing candidates for F197 == "BMS"
+ *   * the BMS is addressed at 785 - per Tata's own diagnostic tool, across the
+ *     passenger range - and nothing else on the bus is ever asked
  *   * series cell count is DERIVED (pack V / mean cell V), never hardcoded
  *   * a DID that does not answer simply reads as "--" instead of breaking
  *
@@ -63,41 +63,32 @@ final class BmsFields {
     }
 
     /**
-     * Diagnostic request IDs to probe when locating the BMS. Ordered by
-     * likelihood: the known Nexon address first, then the rest of the 0x78x
-     * block, then the other IDs that answered UDS on the Nexon, then the
-     * ISO-standard addresses in case another model uses them.
+     * The one address this app talks to: Tata's battery controller, 11-bit CAN
+     * at 500 kbaud. It is where Tata's own diagnostic tool addresses the BMS
+     * across the passenger range; replies come from 78D. Verified on the Nexon
+     * EV Max. Nothing else on the bus is ever asked.
      */
-    static final List<String> BMS_CANDIDATES = Collections.unmodifiableList(Arrays.asList(
-            "785", "786", "787", "788", "789", "78A", "78B", "780", "781", "782",
-            "783", "784", "790", "791", "7A5", "7B5",
-            "700", "701", "702", "703", "705", "710", "723", "730",
-            "750", "752", "754",
-            "7E0", "7E1", "7E2", "7E3", "7E4", "7E5", "7E6", "7E7"
-    ));
+    static final String BMS_REQUEST = "785";
 
     /**
-     * 29-bit physical request ids, from the ECU catalogs shipped with Tata's
-     * service tool: the tester is F1, the Gotion BMS is logical address 0x96
-     * and the TacoGotion/Kratos BMS is 0xF3. ISO's 18DA prefix and Tata's own
-     * 1BDA prefix are both tried; replies swap the low bytes (18DAF196).
+     * What the two connect failures say. Shared, because the dashboard and the
+     * Scan screen probe the controller the same way and had drifted into two
+     * wordings for the same outcome.
      */
-    static final List<String> BMS_CANDIDATES_29 = Collections.unmodifiableList(Arrays.asList(
-            "18DA96F1", "1BDA96F1", "18DAF3F1", "1BDAF3F1"
-    ));
-
-    /**
-     * The short list for the 250 kbaud rungs. A 500 kbaud car's adapter at the
-     * wrong rate hears only errors, so each probe runs to its timeout; three
-     * addresses and a broadcast bound that at well under a minute.
-     */
-    static final List<String> BMS_CANDIDATES_250K = Collections.unmodifiableList(Arrays.asList(
-            "785", "7E3", "7E0"
-    ));
+    static final String MSG_ADAPTER_SILENT =
+            "The OBD adapter is not answering - check it is plugged in, powered and paired";
+    static final String MSG_NO_REPLY =
+            "No reply from the battery controller at " + BMS_REQUEST
+                    + " - is the car switched on?";
 
     /** UDS DID holding the ECU's own name; how we recognise the BMS. */
     static final String DID_SYSTEM_NAME = "F197";
     static final String DID_SUPPLIER = "F18A";
+    /**
+     * ECU serial number: unique per pack, and the identity of a car whose
+     * controller serves no VIN. Read only on that path.
+     */
+    static final String DID_SERIAL = "F18C";
     /** UDS DID carrying the VIN; keys the per-vehicle profile. */
     static final String DID_VIN = "F190";
 
@@ -130,12 +121,12 @@ final class BmsFields {
         f.add(new Field("3419", "cell_max_idx", "Max idx",  "",   Kind.U8_RAW,      true));
         f.add(new Field("3409", "temp_a_c",     "Max temp", "C",  Kind.U8_TEMP,     true));
         f.add(new Field("340B", "temp_b_c",     "Min temp", "C",  Kind.U8_TEMP,     true));
-        f.add(new Field("3411", "temp_c_c",     "Coolant out", "C", Kind.U8_TEMP,   true));
+        f.add(new Field("3411", "temp_c_c",     "Outlet temp", "C", Kind.U8_TEMP,   true));
         f.add(new Field("3412", "temp_d_c",     "Avg temp", "C",  Kind.U8_TEMP,     true));
         // A DC-DC-regulated rail: held 13.74 V through a 100 A swing and decayed
         // only once the contactors opened. A tired 12 V battery strands an EV as
         // surely as a flat pack, and nothing else in the car tells the driver.
-        f.add(new Field("3492", "aux_12v_v",    "12V aux",  "V",  Kind.U16_DIV1000, true));
+        f.add(new Field("3492", "aux_12v_v",    "LV supply", "V", Kind.U16_DIV1000, true));
 
         // --- status strip: what the BMS is doing to the pack right now ---
         //
@@ -166,7 +157,7 @@ final class BmsFields {
         f.add(new Field("3482", "link_v",       "Busbar +", "V",  Kind.U16_DIV10,   false));
         f.add(new Field("3481", "busbar_neg_v", "Busbar -", "V",  Kind.U16_DIV10,   false));
         // Pack voltage as the motor controller sees it, 1 V resolution.
-        f.add(new Field("3484", "mcu_dc_v",     "MCU DC",   "V",  Kind.U16_RAW,     false));
+        f.add(new Field("3484", "mcu_dc_v",     "VCU busbar", "V", Kind.U16_RAW,    false));
         // Matched (cell_max_mv - cell_min_mv) on 20 of 36 samples and differed by
         // exactly 1 mV on the rest - the skew between two batched reads.
         f.add(new Field("34D5", "cell_delta_bms_mv", "BMS delta", "mV", Kind.U16_RAW, false));
@@ -205,12 +196,33 @@ final class BmsFields {
     }
 
     /**
+     * Override value meaning "this role is not read on this car at all".
+     *
+     * Clearing an override restores a DEFAULT, which is not the same thing: on a
+     * model where some other reading lives at a role's default DID, that role has
+     * to be able to step aside, or the reading that wants the code can never be
+     * mapped. Not a valid DID (a DID is four hex digits), so it cannot collide
+     * with one, and it is an ordinary override value - so Scan's "Reset to
+     * default DIDs and scales" clears it like any other.
+     */
+    static final String DISABLED = "-";
+
+    static boolean isDisabled(String did) {
+        return did != null && DISABLED.equals(did.trim());
+    }
+
+    /**
      * The DID this field should actually be read from: a user override if one is
      * set for this vehicle, otherwise the default discovered on the Nexon EV Max.
+     *
+     * NULL when the role is switched off for this vehicle. Every caller has to
+     * mean something by that: the poll does not ask for it, the CSV header names
+     * the column "none", and the dashboard caption reads "off".
      */
     static String effectiveDid(Field f, Prefs prefs) {
         if (prefs == null) return f.did;
         String o = prefs.didOverride(f.key);
+        if (isDisabled(o)) return null;
         return (o == null || o.isEmpty()) ? f.did : o;
     }
 
@@ -278,8 +290,7 @@ final class BmsFields {
 
     /**
      * Decode with an optional override. Current never takes one: its zero and
-     * scale live in the calibration the charger routine already adjusts, and a
-     * preset sets those instead.
+     * scale live in the calibration the charger routine already adjusts.
      */
     static Double decode(Field f, byte[] data, Scale s, double currentScale, int currentZero) {
         if (s == null) return decode(f, data, currentScale, currentZero);

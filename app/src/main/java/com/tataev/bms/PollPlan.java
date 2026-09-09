@@ -37,4 +37,20 @@ final class PollPlan {
         if (!cellsEverDecoded) return Fast.DROP_TO_SINGLE;
         return rawEmpty ? Fast.EMPTY : Fast.SKIP;
     }
+
+    /**
+     * A batched read got no reply. That used to end the group: asking a mute
+     * ECU one DID at a time only waits out three more timeouts. But an ECU that
+     * ignores the multi-DID FORM looks exactly the same, and such ECUs exist:
+     * single reads answer, three-at-once gets silence. So the group is mute
+     * only when the single reads are silent as well.
+     */
+    static boolean groupMute(boolean batchSilent, int singlesAnswered) {
+        return batchSilent && singlesAnswered == 0;
+    }
+
+    /** Twice is a pattern: stop batching on this link, as an explicit NRC 0x13 already does. */
+    static boolean dropBatching(int silentBatchesWithSingles) {
+        return silentBatchesWithSingles >= 2;
+    }
 }
