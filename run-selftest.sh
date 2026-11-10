@@ -17,7 +17,7 @@ mkdir -p "$OUT/src/com/tataev/bms"
 for f in UdsCodec BmsFields DidScanner CommandGuard Alerter Reading Beeper \
          PackMap LogReader ProfileMatch Palette PackReport LogSummary PackHistory \
          CurrentCalibration CsvFormat PollPlan ConnectPlan ZeroCheck BmsStatus \
-         AdapterCaps Redact PollReport GroupMoments; do
+         AdapterCaps Redact PollReport GroupMoments DriveCurve LinkGate; do
     cp "app/src/main/java/com/tataev/bms/$f.java" "$OUT/src/com/tataev/bms/"
 done
 cp selftest/com/tataev/bms/*.java "$OUT/src/com/tataev/bms/"

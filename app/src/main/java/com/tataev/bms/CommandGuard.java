@@ -50,13 +50,22 @@ final class CommandGuard {
             "ATFCSM1",      // flow-control mode
     };
 
-    /** AT commands that take a CAN id: 3 hex digits. */
+    /** The battery controller's reply id; requests go to BmsFields.BMS_REQUEST. */
+    private static final String BMS_RESPONSE = UdsCodec.responseIdFor(BmsFields.BMS_REQUEST);
+
+    /**
+     * AT commands that take a CAN id, each pinned to the one id this app uses.
+     *
+     * Any 3-hex id used to pass, so "BMS only" rested on every caller passing
+     * the right constant. Pinned, it is a property of the guard: ATSH7DF, the
+     * functional broadcast every module answers, cannot be sent at all.
+     */
     private static final String[] ALLOWED_AT_WITH_ID = {
-            "ATSH",         // set request header
-            "ATCRA",        // receive filter
-            "ATFCSH",       // flow-control header
-            "ATCF",         // receive filter, the pre-v1.3 form (adapter-local)
-            "ATCM",         // receive mask for it (adapter-local)
+            "ATSH" + BmsFields.BMS_REQUEST,     // set request header
+            "ATFCSH" + BmsFields.BMS_REQUEST,   // flow-control header
+            "ATCRA" + BMS_RESPONSE,             // receive filter
+            "ATCF" + BMS_RESPONSE,              // receive filter, the pre-v1.3 form
+            "ATCM7FF",                          // exact-match mask for it
     };
 
     /**
@@ -108,17 +117,10 @@ final class CommandGuard {
         for (String ok : ALLOWED_AT) {
             if (c.equals(ok)) return true;
         }
-        for (String prefix : ALLOWED_AT_WITH_ID) {
-            if (c.startsWith(prefix) && isCanId(c.substring(prefix.length()))) {
-                return true;
-            }
+        for (String ok : ALLOWED_AT_WITH_ID) {
+            if (c.equals(ok)) return true;
         }
         return false;
-    }
-
-    /** A CAN id is three hex digits, the 11-bit form. Nothing else. */
-    private static boolean isCanId(String id) {
-        return id.length() == 3 && isHex(id);
     }
 
     /**

@@ -609,7 +609,8 @@ final class DidScanner {
      * The heuristics lean on physics rather than Tata's numbering, so they should
      * transfer between models:
      *   * a 2-byte value whose tenth lands in 0..100 is SOC or SOH; the one that
-     *     moves between samples is SOC, the steadier high one is SOH
+     *     moves between samples is SOC, the steadier high one is SOH - and only
+     *     when an SOC was found, since a parked SOC is steady too
      *   * a 1-byte value that moves and stays within the cell-group count is an index
      *   * a steady 1-byte value in 20..120 (i.e. -20..80 C) is a temperature
      */
@@ -714,7 +715,12 @@ final class DidScanner {
         for (Hit h : pct) {
             if (h.changed() && h.first() >= floor && socSwingOk(h, 20) && soc == null) soc = h;
         }
-        for (Hit h : pct) {
+        // SOH only beside an SOC. On a parked car the SOC holds still across two
+        // reads milliseconds apart, so "the highest steady value in 70-100 %" is
+        // as likely to be the SOC itself (the Tiago's 3421 at 75.8 %): applied,
+        // the SOH tile would fall while driving. Having found the moving one is
+        // what makes the steady one mean SOH.
+        for (Hit h : soc == null ? Collections.<Hit>emptyList() : pct) {
             if (h == soc) continue;
             int v = h.first();
             if (v >= 700 && v <= 1000 && (soh == null || v > soh.first())) soh = h;
@@ -934,8 +940,8 @@ final class DidScanner {
     /**
      * Drop every wanted role whose DID is already another role's in force.
      * suggest() can name a DID that an earlier pick already gave to a
-     * different role (3421 as SOH on a car where it is SOC); refusing the
-     * whole apply for that used to block mapping the temperatures.
+     * different role (it once named 3421 as SOH on a car where it is SOC);
+     * refusing the whole apply for that used to block mapping the temperatures.
      */
     static Map<String, String> withoutClashes(Map<String, String> wanted,
                                               Map<String, String> effectiveOthers,
@@ -961,6 +967,32 @@ final class DidScanner {
             kept.put(e.getKey(), e.getValue());
         }
         return kept;
+    }
+
+    /**
+     * The scale override each role must carry once its DID is applied.
+     *
+     * A DID and its decoding travel together. Writing only the DID left an
+     * earlier one-tap pick's override in force: SOC moved from a whole-percent
+     * code (1;0;2) to a tenths one then read 758 % and was logged that way. So
+     * every applied role gets an entry - the scale the pick implies, or "" for
+     * the built-in decoding, which is how everything suggest() names is read.
+     *
+     * @param applied role -> DID about to be written
+     * @param implied role -> the scale the pick implies ("1;0;2" for a
+     *                whole-percent SOC, "10;0;2" for 10 mV cells); null, or a
+     *                role left out, means the built-in decoding
+     * @return role -> override to write, one per applied role; "" clears it
+     */
+    static Map<String, String> scalesOnApply(Map<String, String> applied,
+                                             Map<String, String> implied) {
+        Map<String, String> out = new LinkedHashMap<>();
+        if (applied == null) return out;
+        for (String role : applied.keySet()) {
+            String s = implied == null ? null : implied.get(role);
+            out.put(role, s == null ? "" : s);
+        }
+        return out;
     }
 
     /**

@@ -48,11 +48,6 @@ public final class BmsService extends Service {
      */
     static final int SLOW_EVERY = 5;
     /**
-     * Floor on the cycle time: the adapter's own pace. This used to be a
-     * setting; it only ever set a minimum under a maximum the adapter fixes.
-     */
-    static final long MIN_CYCLE_MS = 250L;
-    /**
      * Wake-lock lease, renewed on every successful poll.
      *
      * This used to be a single four-hour lock taken at startup. On a session
@@ -275,6 +270,16 @@ public final class BmsService extends Service {
     private int emptyPolls;
     /** Consecutive polls the ECU answered without producing a single known value. */
     private int unmappedPolls;
+    /** "Not served here" refusals (NRC 0x31) in the poll under way, counted by readSingly. */
+    private int cycleRefusals;
+    /** Links in a row that never produced a usable reading; bounds the reconnect loop. */
+    private final PollPlan.FruitlessLinks fruitlessLinks = new PollPlan.FruitlessLinks();
+    /**
+     * The log failed on this link (storage full or unwritable). Not retried until
+     * the next connect: retrying every cycle left a 0-byte file per attempt.
+     */
+    private boolean logBroken;
+    private static final String LOG_STOPPED = "Logging stopped: storage full or unwritable";
     /** Multi-DID reads are assumed to work until this ECU proves otherwise. */
     private boolean batchingWorks = true;
     private int batchFailures;
@@ -285,6 +290,10 @@ public final class BmsService extends Service {
     /** The request id this connect is polling, for the poll report. */
     private String activeTarget = "";
     private long lastKeepAliveMs;
+    /** This link asked for the extended session (an Expert opt-in), so it is held. */
+    private boolean sessionWanted;
+    /** This link's identity reads could not confirm the active profile's car. */
+    private boolean profileUnconfirmed;
     /** Previous successful poll, for the achieved-cadence readout. */
     private long lastSampleMs;
     /** Cycles since connect; every SLOW_EVERY-th (the first included) is a slow cycle. */
@@ -314,6 +323,8 @@ public final class BmsService extends Service {
     /** Kept so the give-up message can say WHY, not just that it gave up. */
     private String lastFailureReason = "no response from the adapter";
     private static final int MAX_CONNECT_FAILURES = 12;   // ~1 minute of retries
+    /** The wait before reconnecting, after a failed connect or a dropped link alike. */
+    private static final long RECONNECT_PAUSE_MS = 5000L;
     /** Connects in a row where 785 gave no reply. */
     private int silentConnects;
 
@@ -342,13 +353,27 @@ public final class BmsService extends Service {
     public int onStartCommand(Intent intent, int flags, int startId) {
         try {
             startForeground(NOTIF_ID, buildNotification("Starting..."));
-        } catch (RuntimeException e) {
+        } catch (SecurityException e) {
             // A connectedDevice foreground service requires BLUETOOTH_CONNECT.
             // START_STICKY means the system restarts us after a process death, so
             // if the user revoked that permission in between, this throws on every
             // restart - an uncaught throw here is a crash loop, not a one-off.
             Log.e(TAG, "cannot start in foreground", e);
             fatal("Bluetooth permission denied - grant it in app settings");
+            return START_NOT_STICKY;
+        } catch (RuntimeException e) {
+            // Not a permission. The usual one is a sticky restart from the
+            // background on Android 12+, which throws
+            // ForegroundServiceStartNotAllowedException; matched by name, as the
+            // class does not exist below API 31. Blaming the permission sent
+            // owners to a setting that was already granted.
+            Log.e(TAG, "cannot start in foreground", e);
+            fatal("android.app.ForegroundServiceStartNotAllowedException"
+                    .equals(e.getClass().getName())
+                    ? "Android did not allow the logger to start from the background "
+                            + "- open the app and tap Connect"
+                    : "Android did not allow the logger to start - open the app and "
+                            + "tap Connect");
             return START_NOT_STICKY;
         }
         // The mirror of ScanActivity's own check. These clones carry one
@@ -440,6 +465,14 @@ public final class BmsService extends Service {
                 long started = SystemClock.elapsedRealtime();
                 try {
                     if (!client.isConnected()) {
+                        if (fruitlessLinks.spent()) {
+                            // Every link came up and none produced a reading.
+                            // Says how the last one ended, as the connect give-up
+                            // does; its poll report, if any, stays offered.
+                            fatal("No usable reading after " + PollPlan.FruitlessLinks.BUDGET
+                                    + " connects - " + withoutRetrySuffix(lastFailureReason));
+                            return;
+                        }
                         if (!establish(client)) {
                             if (!running) return;      // a fatal failure stopped us
                             if (++consecutiveConnectFailures >= MAX_CONNECT_FAILURES) {
@@ -454,18 +487,26 @@ public final class BmsService extends Service {
                                 stopSelf();
                                 return;
                             }
-                            // The lease is otherwise renewed only by a successful
-                            // poll, and twelve retries can outlive it.
-                            refreshWakeLock();
-                            sleep(5000);       // back off before retrying
+                            pauseBeforeReconnect();
                             continue;
                         }
                         consecutiveConnectFailures = 0;
+                        fruitlessLinks.linkUp();
                     }
                     pollOnce(client);
+                    if (!client.isConnected()) {
+                        // The poll dropped the link: lost, or nothing came back.
+                        // A link that never read anything reconnecting at once
+                        // cost a full reset and probe every second or two against
+                        // a controller that had gone quiet; wait as a failed
+                        // connect does. A link that WAS reading reconnects now.
+                        if (fruitlessLinks.lastLinkFruitless()) pauseBeforeReconnect();
+                        continue;
+                    }
                     holdSession(client);
                     // The floor is the CADENCE, not a gap tacked onto however long
                     // the round-trips took; a cycle that took longer waits nothing.
+                    // Read every cycle, so a change in Settings applies at once.
                     //
                     // INSIDE the guard: idle() calls holdSession() between sleep
                     // chunks, so a RuntimeException from the keep-alive path used
@@ -474,13 +515,14 @@ public final class BmsService extends Service {
                     // one call that was outside it. An error now skips the rest of
                     // this cycle and reconnects, which is what the message says.
                     long spent = SystemClock.elapsedRealtime() - started;
-                    idle(client, MIN_CYCLE_MS - spent);
+                    idle(client, prefs.pollMs() - spent);
                 } catch (RuntimeException e) {
                     // A malformed frame must never kill this thread: the service
                     // would stay alive as a zombie, frozen on the last reading.
                     Log.e(TAG, "poll error", e);
                     client.close();
                     fail("Recovered from error - reconnecting");
+                    pauseBeforeReconnect();
                 }
             }
         } finally {
@@ -492,13 +534,23 @@ public final class BmsService extends Service {
     }
 
     /**
+     * Wait before the next connect. The lease is otherwise renewed only by a
+     * successful poll, and a run of retries can outlive it.
+     */
+    private void pauseBeforeReconnect() {
+        if (!running) return;
+        refreshWakeLock();
+        sleep(RECONNECT_PAUSE_MS);
+    }
+
+    /**
      * Wait out the poll interval without letting the ECU's S3 timer expire.
      *
      * TesterPresent used to be sent only between polls, so at the 10 s interval
-     * Settings allows the bus went quiet for far longer than a typical 5 s S3
-     * timer. The extended session is opened once, in establish(), and never
-     * re-opened - so once it lapsed, every extended-session-only DID would read
-     * blank for the rest of the drive with nothing on screen to say why.
+     * Settings allowed the bus went quiet for far longer than a typical 5 s S3
+     * timer. With the extended session opted into, a lapse would blank every
+     * extended-session-only DID for the rest of the drive with nothing on
+     * screen to say why. With it off (the default), holdSession sends nothing.
      */
     private void idle(ElmClient client, long ms) {
         long remaining = ms;
@@ -511,11 +563,15 @@ public final class BmsService extends Service {
     }
 
     /**
-     * Keep the extended session alive. The ECU drops back to the default session
-     * after a few seconds of silence, which would silently blank every
-     * extended-session-only DID for the rest of the drive.
+     * Keep the extended session alive, when this link opened one. The ECU drops
+     * back to the default session after a few seconds of silence, which would
+     * silently blank every extended-session-only DID for the rest of the drive.
+     *
+     * Nothing at all when the session is off: no 3E00, no re-open. Switching it
+     * off in Settings stops the keep-alive at once and lets the session lapse.
      */
     private void holdSession(ElmClient client) {
+        if (!sessionWanted || !prefs.extendedSession()) return;
         // pollOnce closes the client on link loss; a keep-alive into a closed
         // socket is one wasted round and a logged re-open failure per drop.
         if (!client.isConnected()) return;
@@ -526,7 +582,9 @@ public final class BmsService extends Service {
             // request, it is cheap, and the alternative is extended-only DIDs
             // reading blank for the rest of the drive with nothing to explain it.
             // A refusal is not fatal - the default-session DIDs still work - so
-            // the outcome only goes to the log.
+            // the outcome only goes to the log. If the miss was an adapter reset,
+            // raw() refuses the 1003 (the header is no longer 785) and the next
+            // poll reconnects through the full setup.
             try {
                 if (!client.enterExtendedSession()) {
                     Log.i(TAG, "extended session refused on re-open; "
@@ -550,12 +608,25 @@ public final class BmsService extends Service {
         return s;
     }
 
-    /** Connect, locate the BMS, and open the extended session. */
+    /** Connect, locate the BMS, and open the extended session if opted into. */
     private boolean establish(ElmClient client) {
         // A trouble from an earlier attempt must not sit under an unrelated
         // failure on this one; the card follows whatever THIS attempt hit.
         trouble = Trouble.NONE;
         pollReportPath = null;      // this link's evidence, not the last one's
+        sessionWanted = false;
+        // Before the probe, so a report from a connect that fails there does not
+        // list the roles and batching of the previous link as if this one had
+        // asked them. A new link may be a different vehicle or adapter, so the
+        // batching optimisation gets another chance rather than staying latched
+        // off, and the poll debounces start from zero.
+        lastResolvedRoles = new ArrayList<>();
+        batchingWorks = true;
+        batchFailures = 0;
+        silentBatches = 0;
+        emptyPolls = 0;
+        unmappedPolls = 0;
+        logBroken = false;          // a new link tries the log again
         try {
             BluetoothAdapter adapter = bluetoothAdapter();
             if (adapter == null || !adapter.isEnabled()) {
@@ -594,13 +665,13 @@ public final class BmsService extends Service {
                 // transcript and the adapter's own refusals: "nothing came back"
                 // is the outcome a screenshot of one sentence cannot explain, and
                 // which of the three causes it was lives in this file.
-                savePollReport(client, BmsFields.MSG_ADAPTER_SILENT);
+                savePollReport(client, BmsFields.MSG_ADAPTER_SILENT, false);
                 client.close();
                 fail(BmsFields.MSG_ADAPTER_SILENT);
                 return false;
             }
             if (probe == ConnectPlan.Probe.NO_REPLY) {
-                savePollReport(client, BmsFields.MSG_NO_REPLY);
+                savePollReport(client, BmsFields.MSG_NO_REPLY, false);
                 client.close();
                 if (++silentConnects < 2) {
                     // A car that is not awake yet looks exactly like this; the
@@ -616,7 +687,11 @@ public final class BmsService extends Service {
                 return false;
             }
             silentConnects = 0;
-            client.enterExtendedSession();
+            // Off by default: nothing the Nexon serves needs it, and holding it
+            // for the whole drive is the prime suspect for the dash warnings.
+            // Read once per link; holdSession only holds what this link opened.
+            sessionWanted = prefs.extendedSession();
+            if (sessionWanted) client.enterExtendedSession();
             String name = client.readIdString(BmsFields.DID_SYSTEM_NAME);
             String supplier = name == null ? null : client.readIdString(BmsFields.DID_SUPPLIER);
             if (!destroyed) {
@@ -626,11 +701,6 @@ public final class BmsService extends Service {
             }
             identifyVehicle(client);
 
-            // A new link may be a different vehicle or adapter, so give the
-            // batching optimisation another chance rather than staying latched off.
-            batchingWorks = true;
-            batchFailures = 0;
-            silentBatches = 0;
             alerter.reset();          // a new link starts the alert windows over
             zeroCheck.reset();
             calibrationHint = "";
@@ -642,6 +712,11 @@ public final class BmsService extends Service {
                 // per-group evidence either (one Bluetooth hiccup used to erase
                 // every observation), and identifyVehicle has just settled which
                 // case this is. Reset only when the vehicle changed.
+                //
+                // The open log goes too: its VIN column was fixed when it was
+                // opened, so the other car's rows would be tallied into this
+                // car's history. The start() below opens a new file.
+                csv.stop();
                 packMap = new PackMap();
                 packMapProfile = profileNow;
                 alerter.forgetVerdicts();     // a new map's verdicts are news again
@@ -665,12 +740,14 @@ public final class BmsService extends Service {
                     csv.start();
                 } catch (IOException e) {
                     // Storage full or unavailable. The pack is still readable, so
-                    // losing the log must not be reported as a failed connection.
+                    // losing the log must not be reported as a failed connection;
+                    // it is reported as what it is, in the status line.
                     Log.w(TAG, "cannot open log file: " + e.getMessage());
+                    logBroken = true;
                 }
             }
             trouble = Trouble.NONE;       // whatever went wrong before, this link works
-            setState(State.RUNNING, "Connected");
+            setState(State.RUNNING, connectedText());
             publish(null);
             return true;
         } catch (IOException e) {
@@ -688,69 +765,58 @@ public final class BmsService extends Service {
     /**
      * Bind this connection to a vehicle profile, keyed by VIN.
      *
-     * Read-only like everything else: at most two 0x22 identity reads, both to
-     * the BMS already targeted - no other ECU is touched. When the BMS serves
-     * no VIN, a fingerprint of address + supplier stands in; when neither is
-     * readable the active profile simply stays, because churning profiles on a
-     * bad link would scatter one car's calibration across several records.
+     * Read-only like everything else: identity reads are 0x22 to the BMS
+     * already targeted - no other ECU is touched. When the BMS serves no VIN,
+     * its serial number stands in (address + supplier on a controller with
+     * none). The decision itself is ProfileMatch.bind, pure and tested: it
+     * adopts a profile on file under the pre-serial key, and when a read the
+     * active profile is keyed by fails it STAYs, because churning profiles on
+     * a bad link would scatter one car's calibration across several records.
      *
-     * On the unresolved path below - VIN-keyed profile, no VIN read - nothing is
-     * attached at all, because this may not be that profile's car.
+     * On the unresolved path nothing is attached and nothing is learned
+     * (persistLearned), because this may not be that profile's car.
      */
     private void identifyVehicle(ElmClient client) {
         String vin = ProfileMatch.extractVin(client.readIdString(BmsFields.DID_VIN));
         // The OUTCOME, never the value: which of "refused", "timed out" and
         // "answered" happened is the whole diagnosis when a profile will not bind.
         Log.i(TAG, "VIN read: " + client.lastVinReadOutcome());
-        boolean byVin = !vin.isEmpty();
-        int active = prefs.activeProfile();
-        // The serial read happens only on the VIN-less branch: a ternary does not
-        // evaluate the arm it does not take, so a car that served its VIN adds no
-        // request to the wire.
-        String id = byVin ? vin
-                : ProfileMatch.fingerprint(client.readIdString(BmsFields.DID_SERIAL),
-                        client.readIdString(BmsFields.DID_SUPPLIER));
-        boolean unresolved = false;
-        if (!byVin && !prefs.profileVin(active).isEmpty()) {
-            // The active profile is VIN-keyed but this connect read no VIN. The
-            // same car with a flaky F190 read is far more likely than a
-            // different VIN-less Tata, and both guesses are destructive: CREATE
-            // would mint a junk profile on every hiccup, ADOPT would merge two
-            // cars into one record. Treat it as unidentified - STAY, attaching
-            // nothing.
-            id = "";
-            unresolved = true;
+        // Serial and supplier are asked only without a VIN, so a car that served
+        // its VIN adds no request to the wire.
+        String serial = null, supplier = null;
+        if (vin.isEmpty()) {
+            serial = client.readIdString(BmsFields.DID_SERIAL);
+            supplier = client.readIdString(BmsFields.DID_SUPPLIER);
         }
-        String activeId = byVin ? prefs.profileVin(active)
-                : prefs.profileFingerprint(active);
-        int match = byVin ? prefs.profileByVin(id) : prefs.profileByFingerprint(id);
-        ProfileMatch.Action action = ProfileMatch.decide(id, activeId,
-                match > 0 && match != active);
-        switch (action) {
+        ProfileMatch.Binding b = ProfileMatch.bind(vin, serial, supplier,
+                prefs.activeProfile(), prefs.profileVins(), prefs.profileFingerprints());
+        profileUnconfirmed = b.unresolved;
+        switch (b.action) {
             case SWITCH:
-                prefs.setActiveProfile(match);
-                Log.i(TAG, "known vehicle - switched to profile " + match);
+                prefs.setActiveProfile(b.profile);
+                Log.i(TAG, "known vehicle - switched to profile " + b.profile);
                 break;
             case CREATE:
                 int fresh = prefs.createProfile();
                 prefs.setActiveProfile(fresh);
-                Log.i(TAG, "new vehicle " + id + " - created profile " + fresh);
+                Log.i(TAG, "new vehicle - created profile " + fresh);
                 break;
             case ADOPT:
             case STAY:
                 break;
         }
         int now = prefs.activeProfile();
-        if (byVin) prefs.setProfileVin(now, vin);
-        else if (!id.isEmpty()) prefs.setProfileFingerprint(now, id);
+        if (!b.vin.isEmpty()) prefs.setProfileVin(now, b.vin);
+        // Also rekeys an adopted pre-serial profile to its serial.
+        if (!b.fingerprint.isEmpty()) prefs.setProfileFingerprint(now, b.fingerprint);
         if (prefs.profileName(now).isEmpty()) {
-            prefs.setProfileName(now, byVin
+            prefs.setProfileName(now, !b.vin.isEmpty()
                     ? "Tata EV · " + vin.substring(vin.length() - 4)
                     : "Vehicle " + now);
         }
         // On the unresolved path the profile's name would assert an
         // identification that did not happen; label the session honestly.
-        String pn = unresolved ? "profile unconfirmed" : prefs.profileName(now);
+        String pn = b.unresolved ? "profile unconfirmed" : prefs.profileName(now);
         if (!destroyed && !pn.isEmpty()) {
             bmsInfoText = bmsInfoText + "  ·  " + pn;
         }
@@ -761,7 +827,8 @@ public final class BmsService extends Service {
      *
      * @return how many answered, or -1 when the link died (already reported, and
      *         the caller must return: readDid returns null on SILENCE rather
-     *         than throwing, so an IOException here is always the socket).
+     *         than throwing, so an IOException here means the link is unusable -
+     *         the socket, or an adapter that reset itself or stopped answering).
      */
     private int readSingly(ElmClient client, List<BmsFields.Field> group, List<String> dids,
                            Reading r, Map<String, BmsFields.Scale> scales, double scale, int zero) {
@@ -775,6 +842,11 @@ public final class BmsService extends Service {
                     r.raw.put(f.key, UdsCodec.toHex(resp.data));
                     Double v = BmsFields.decode(f, resp.data, scales.get(f.key), scale, zero);
                     if (v != null) r.values.put(f.key, v);
+                } else if (resp != null && resp.negative && PollPlan.isMappingRefusal(resp.nrc)) {
+                    // A "not served here" refusal never reaches the reading;
+                    // counted so a controller that refuses everything is not
+                    // taken for silence.
+                    cycleRefusals++;
                 }
             } catch (IOException e) {
                 client.close();
@@ -790,6 +862,9 @@ public final class BmsService extends Service {
      * the numbers are the pack's rather than one noisy reading's.
      */
     private void persistLearned() {
+        // Unconfirmed, this may be another car on the active profile: its group
+        // count would be stored as that car's and seed the next drive with it.
+        if (profileUnconfirmed) return;
         PackMap m = packMap;
         // Settled, not merely sampled: a provisional count taken under load used
         // to be stored, and then seeded the next drive's pinned baseline with it.
@@ -830,13 +905,27 @@ public final class BmsService extends Service {
         }
     }
 
-    /** The transcript behind a poll that decoded nothing, saved to share. */
-    private void savePollReport(ElmClient client, String reason) {
+    /**
+     * The transcript behind a poll that decoded nothing, saved to share.
+     *
+     * @param linkUp whether this link reached the controller, or failed at the probe
+     */
+    private void savePollReport(ElmClient client, String reason, boolean linkUp) {
         pollReportPath = saveReport("poll", "", "",
                 PollReport.render(client.caps().report(), CsvLogger.appVersion(this),
                         client.protocol(), activeTarget, batchingWorks,
                         lastResolvedRoles, client.recentTraffic(), reason,
-                        client.lastVinReadOutcome(), client.lastSessionOutcome()));
+                        client.lastVinReadOutcome(), client.lastSessionOutcome(), linkUp));
+        // A link that keeps failing writes one of these every few seconds, and
+        // nothing else ever deleted them. Never the one just written: after the
+        // clock steps back it can sort as the oldest, and it is the one offered.
+        java.io.File dir = CsvLogger.logsDir(this);
+        for (String name : PollReport.stale(dir.list())) {
+            java.io.File f = new java.io.File(dir, name);
+            if (f.getAbsolutePath().equals(pollReportPath)) continue;
+            //noinspection ResultOfMethodCallIgnored
+            f.delete();
+        }
     }
 
     private void pollOnce(ElmClient client) {
@@ -860,6 +949,7 @@ public final class BmsService extends Service {
 
         final boolean slowCycle = singleSpeed || pollCount % SLOW_EVERY == 0;
         pollCount++;
+        cycleRefusals = 0;
         List<BmsFields.Field> wanted = new ArrayList<>();
         for (BmsFields.Field f : BmsFields.ALL) {
             // A non-primary field exists only to be logged. Primary fields feed
@@ -935,8 +1025,10 @@ public final class BmsService extends Service {
                 // 785, which is far more disruptive than skipping a sample.
                 transportError = true;
             } catch (IOException e) {
-                // A real transport error - the socket is gone. Retrying the other
-                // groups would only wait out their timeouts, so reconnect now.
+                // The link is unusable - the socket, or an adapter that reset or
+                // stopped answering (ElmClient.raw refuses to write past either).
+                // Retrying the other groups would only wait out their timeouts,
+                // so reconnect now.
                 client.close();
                 fail("Link lost - reconnecting");
                 return;
@@ -1018,11 +1110,12 @@ public final class BmsService extends Service {
             }
         }
         if (!r.isUsable()) {
-            // The link is fine (the ECU answered the batch probes) but none of the
-            // DIDs we know produced a value - most likely this model uses a
-            // different map. Reconnecting would not help, so say what to do
-            // instead of thrashing.
-            if (r.raw.isEmpty()) {
+            // Silence reconnects; an answer that decodes to nothing - data we
+            // cannot read, or only refusals - most likely means this model uses
+            // a different map. Reconnecting would not help that, so say what to
+            // do instead of thrashing.
+            if (PollPlan.judgeUnusable(slowCycle, r.raw.isEmpty(), cycleRefusals)
+                    == PollPlan.Unusable.EMPTY) {
                 // Two in a row, not one: a single silent poll is a bus hiccup, and
                 // this is the only debounce left now that a silent group no longer
                 // tears the link down on the spot.
@@ -1034,7 +1127,7 @@ public final class BmsService extends Service {
                     // Written BEFORE the close, while the client still holds the
                     // transcript: two polls that came back with nothing at all is
                     // the case a screenshot of "--" cannot explain.
-                    savePollReport(client, why);
+                    savePollReport(client, why, true);
                     client.close();
                     fail(why);
                 }
@@ -1064,9 +1157,14 @@ public final class BmsService extends Service {
                     // while telling them to run it. Scan itself also refuses to
                     // start while this service is up.
                     trouble = Trouble.UNMAPPED;
+                    // A DID gated to the extended session answers 0x31 like an
+                    // unmapped one does, and that session is now opt-in: on a
+                    // model that needs it, the fix is a switch, not a scan.
                     String why = "The battery controller answers, but not with codes this app "
-                            + "knows - this car needs mapping";
-                    savePollReport(client, why);
+                            + "knows - this car needs mapping"
+                            + (prefs.extendedSession() ? "" : ". If it has never read on "
+                            + "this car, first try Settings - Expert - Extended diagnostic session");
+                    savePollReport(client, why, true);
                     fatal(why);
                 }
             }
@@ -1074,6 +1172,7 @@ public final class BmsService extends Service {
         }
         emptyPolls = 0;
         unmappedPolls = 0;
+        fruitlessLinks.usableReading();
         // Live numbers on the screen and a "nothing decoded" report beside them
         // would be two different stories about the same link.
         pollReportPath = null;
@@ -1120,21 +1219,29 @@ public final class BmsService extends Service {
 
         latestReading = r;
         latestElapsedMs = nowMs;
-        setState(State.RUNNING, "Connected");
 
         // Logging can be toggled mid-drive; open or close the file to match.
         try {
             // !destroyed: a worker outliving onDestroy (a blocked read past the
             // join timeout) must not reopen a fresh file for one orphan row.
-            if (logging && !destroyed) {
+            if (logging && !destroyed && !logBroken) {
                 csv.start();
                 csv.write(r);
             } else if (csv.isOpen()) {
                 csv.stop();
             }
         } catch (IOException e) {
-            Log.w(TAG, "csv write failed: " + e.getMessage());
+            // Storage full or the card gone. This used to reach logcat only:
+            // the "logging N" counter froze, and a failed open was retried -
+            // leaving a file behind - on every cycle. Stop for this link and
+            // say so where the owner looks.
+            Log.w(TAG, "csv failed: " + e.getMessage());
+            csv.stop();
+            logBroken = true;
+            lastNotifyMs = 0;     // past the throttle: the notification says it now
         }
+        // After the log, so a log that just failed is in this status, not the next.
+        setState(State.RUNNING, connectedText());
 
         packMap.add(r);
         persistLearned();
@@ -1204,9 +1311,17 @@ public final class BmsService extends Service {
         // spread readout and the alert banner keep painting minutes-old numbers
         // that still look live while the pack is not being monitored at all.
         latestReading = null;
+        // The hint is about the current on a live link. Left up, it outlived the
+        // link and sat where the poll-report offer for the failure goes.
+        calibrationHint = "";
         setState(State.ERROR, message);
         publish(null);
         updateNotificationText(message);
+    }
+
+    /** "Connected", plus why the log stopped if it did: a frozen counter was the only sign. */
+    private String connectedText() {
+        return logBroken && prefs.loggingEnabled() ? "Connected - " + LOG_STOPPED : "Connected";
     }
 
     private void publish(String alert) {
@@ -1332,6 +1447,8 @@ public final class BmsService extends Service {
                 && SystemClock.elapsedRealtime() - lastVerdictMs < VERDICT_SHOWN_MS) {
             text = text + "\n" + lastVerdict;
         }
+        // With the screen off this is the only place a stopped log can show.
+        if (logBroken && prefs.loggingEnabled()) text = text + "\n" + LOG_STOPPED;
         updateNotificationText(text);
     }
 

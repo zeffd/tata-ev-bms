@@ -24,6 +24,11 @@ final class SystemBars {
      * Pad {@code root} by the system bars, preserving whatever padding it already
      * has. Also covers display cutouts, so the layout survives a notch or a
      * punch-hole camera in landscape.
+     *
+     * On API 30+ the keyboard is included too. Edge-to-edge, Android 15 no
+     * longer resizes the window for it, so without this the keyboard covered
+     * the lower Settings fields. Where the system still fits the window (below
+     * 15) these insets arrive already consumed, so nothing is added twice.
      */
     static void pad(View root) {
         final int left = root.getPaddingLeft();
@@ -34,8 +39,8 @@ final class SystemBars {
         root.setOnApplyWindowInsetsListener((v, insets) -> {
             int l, t, r, b;
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                Insets bars = insets.getInsets(
-                        WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout());
+                Insets bars = insets.getInsets(WindowInsets.Type.systemBars()
+                        | WindowInsets.Type.displayCutout() | WindowInsets.Type.ime());
                 l = bars.left;
                 t = bars.top;
                 r = bars.right;

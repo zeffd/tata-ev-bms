@@ -12,6 +12,8 @@ import android.view.View;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
+import android.widget.RadioButton;
+import android.widget.RadioGroup;
 import android.widget.ScrollView;
 import android.widget.Switch;
 import android.widget.TextView;
@@ -48,6 +50,9 @@ public final class SettingsActivity extends Activity {
     private static final int ID_AUX = 0x7F00_000D;
     private static final int ID_CHARGER = 0x7F00_000E;
     private static final int ID_AUTO = 0x7F00_000F;
+    private static final int ID_SESSION = 0x7F00_0010;
+    /** One id per poll choice, in PollPlan.POLL_CHOICES_MS order. */
+    private static final int ID_POLL_FIRST = 0x7F00_0011;
 
     private static final String KEY_PROFILE = "shown_profile";
     /** Taps on the version line that open Expert, and how close together. */
@@ -163,6 +168,13 @@ public final class SettingsActivity extends Activity {
             inUse.setTextColor(Palette.WARN);
             body.addView(inUse);
         }
+        if (prefs.extendedSession()) {
+            // Phone-wide, and the one expert switch that changes what the car is
+            // sent: never on without the normal screen saying so.
+            TextView session = note("The extended diagnostic session is on (expert settings).");
+            session.setTextColor(Palette.WARN);
+            body.addView(session);
+        }
         TextView version = note("Tata EV BMS " + versionName());
         version.setPadding(0, dp(24), 0, dp(12));
         version.setOnClickListener(v -> unlockTap());
@@ -217,8 +229,8 @@ public final class SettingsActivity extends Activity {
     private void confirmExpert() {
         new AlertDialog.Builder(this)
                 .setTitle("Show expert settings?")
-                .setMessage("Expert settings hold raw alert thresholds and the current "
-                        + "calibration. They exist "
+                .setMessage("Expert settings hold raw alert thresholds, the current "
+                        + "calibration and how often the battery is read. They exist "
                         + "for mapping a Tata model this app has not seen. Normal use never "
                         + "needs them, and they stay shown until you hide them.")
                 .setPositiveButton("Show", (d, w) -> {
@@ -280,6 +292,10 @@ public final class SettingsActivity extends Activity {
         currentZero.setId(ID_ZERO);
         box.addView(labelled("Zero: the raw count that means 0 A", currentZero));
         currentScale = decimal(String.valueOf(prefs.currentScale()));
+        // Signed: the label says negative flips the sign, and a plain decimal
+        // keypad has no minus key.
+        currentScale.setInputType(InputType.TYPE_CLASS_NUMBER
+                | InputType.TYPE_NUMBER_FLAG_DECIMAL | InputType.TYPE_NUMBER_FLAG_SIGNED);
         currentScale.setId(ID_SCALE);
         box.addView(labelled("Scale: amps per count (negative if this car counts charging "
                 + "upward)", currentScale));
@@ -306,11 +322,24 @@ public final class SettingsActivity extends Activity {
         scan.setOnClickListener(v -> startActivity(new Intent(this, ScanActivity.class)));
         box.addView(scan);
 
+        // Global, applied at once: the poll floor from the next cycle, the
+        // session from the next connect (switching it off stops the keep-alive
+        // at once).
+        box.addView(header("Polling"));
+        box.addView(pollChoice());
+        Switch session = toggle("Extended diagnostic session", prefs.extendedSession());
+        session.setId(ID_SESSION);
+        session.setOnCheckedChangeListener((b, on) -> prefs.setExtendedSession(on));
+        box.addView(session);
+        box.addView(note("Off by default: no reading on the Nexon needs it, and holding a "
+                + "diagnostic session for a whole drive is the prime suspect for dash "
+                + "warnings. Turning it on takes effect on the next connect."));
+
         box.addView(header("Diagnostics"));
         double period = BmsService.actualPeriodS();
         box.addView(note("Tata EV BMS " + versionName()
                 + (period > 0 ? String.format(Locale.ROOT, "  ·  %.1f s per sample", period) : "")
-                + "  ·  cycle floor " + BmsService.MIN_CYCLE_MS + " ms"));
+                + "  ·  cycle floor " + prefs.pollMs() + " ms"));
 
         Button hide = new Button(this);
         hide.setText("Hide expert settings");
@@ -321,6 +350,28 @@ public final class SettingsActivity extends Activity {
         });
         box.addView(hide);
         return box;
+    }
+
+    /** "Poll every: 250 ms · 500 ms · 1 s" - the cycle floor, one tap. */
+    private View pollChoice() {
+        RadioGroup group = new RadioGroup(this);
+        group.setOrientation(LinearLayout.HORIZONTAL);
+        final int[] choices = PollPlan.POLL_CHOICES_MS;
+        int current = prefs.pollMs();
+        for (int i = 0; i < choices.length; i++) {
+            RadioButton b = new RadioButton(this);
+            b.setId(ID_POLL_FIRST + i);
+            b.setText(choices[i] >= 1000 ? (choices[i] / 1000) + " s" : choices[i] + " ms");
+            b.setTextColor(Palette.TEXT);
+            group.addView(b);
+            if (choices[i] == current) group.check(b.getId());
+        }
+        // After the initial check, so building the screen writes nothing.
+        group.setOnCheckedChangeListener((g, id) -> {
+            int i = id - ID_POLL_FIRST;
+            if (i >= 0 && i < choices.length) prefs.setPollMs(choices[i]);
+        });
+        return labelled("Poll every", group);
     }
 
     // ---------------------------------------------------------------- saving

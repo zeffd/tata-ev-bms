@@ -74,11 +74,6 @@ final class Prefs {
     /**
      * Connect on open, once per launch. Global: it is about the phone and the
      * adapter, not the car.
-     *
-     * The poll interval that used to live beside this is gone. It only ever set
-     * a FLOOR under a pace the adapter fixes, and the one reason to wait longer
-     * than the adapter needs - a clone that misbehaves when polled flat out -
-     * has not been seen. The cycle floor is BmsService.MIN_CYCLE_MS.
      */
     boolean autoConnect() {
         return sp.getBoolean("auto_connect", true);
@@ -86,6 +81,33 @@ final class Prefs {
 
     void setAutoConnect(boolean on) {
         sp.edit().putBoolean("auto_connect", on).apply();
+    }
+
+    /**
+     * The cycle floor, 250, 500 or 1000 ms ({@link PollPlan#pollFloorMs}).
+     * Global, like the adapter. A new key: nothing earlier stored one, and any
+     * value Settings does not offer reads as the 500 ms default.
+     */
+    int pollMs() {
+        return PollPlan.pollFloorMs(sp.getInt("poll_floor_ms", PollPlan.DEFAULT_POLL_MS));
+    }
+
+    void setPollMs(int ms) {
+        sp.edit().putInt("poll_floor_ms", PollPlan.pollFloorMs(ms)).apply();
+    }
+
+    /**
+     * Hold the BMS in its extended diagnostic session (1003, kept with 3E00)
+     * on the dashboard and in Scan. Global and OFF by default: no reading on
+     * the Nexon needs it, and a session held for a whole drive is the prime
+     * suspect for the dash warnings one owner saw after long drives.
+     */
+    boolean extendedSession() {
+        return sp.getBoolean("extended_session", false);
+    }
+
+    void setExtendedSession(boolean on) {
+        sp.edit().putBoolean("extended_session", on).apply();
     }
 
     boolean alertsEnabled() {
@@ -432,12 +454,18 @@ final class Prefs {
         return -1;
     }
 
-    int profileByFingerprint(String fp) {
-        if (fp == null || fp.isEmpty()) return -1;
-        for (int id : profileIds()) {
-            if (fp.equals(profileFingerprint(id))) return id;
-        }
-        return -1;
+    /** Every profile's stored VIN by id, in id order - for ProfileMatch.bind. */
+    java.util.Map<Integer, String> profileVins() {
+        java.util.Map<Integer, String> out = new java.util.LinkedHashMap<>();
+        for (int id : profileIds()) out.put(id, profileVin(id));
+        return out;
+    }
+
+    /** Every profile's stored fingerprint by id, in id order - for ProfileMatch.bind. */
+    java.util.Map<Integer, String> profileFingerprints() {
+        java.util.Map<Integer, String> out = new java.util.LinkedHashMap<>();
+        for (int id : profileIds()) out.put(id, profileFingerprint(id));
+        return out;
     }
 
     /** Series group count a previous session derived; 0 = not learned yet. */

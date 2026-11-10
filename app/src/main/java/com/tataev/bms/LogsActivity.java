@@ -21,7 +21,11 @@ import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Date;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
 
 /**
  * Every drive log on the device, newest first.
@@ -40,7 +44,12 @@ public final class LogsActivity extends Activity {
     private static final int OK = Palette.OK;
     private static final int FAINT = Palette.FAINT;
 
+    private static final String STATE_SCROLL = "scroll_y";
+
     private LinearLayout list;
+    private ScrollView scroller;
+    /** Scroll offset saved across a recreation, applied once the list is back; -1 = none. */
+    private int restoreScrollY = -1;
     private final Handler ui = new Handler(Looper.getMainLooper());
 
     @Override
@@ -55,12 +64,19 @@ public final class LogsActivity extends Activity {
         list.setOrientation(LinearLayout.VERTICAL);
         list.setPadding(dp(16), 0, dp(16), dp(28));
 
-        ScrollView sv = new ScrollView(this);
-        sv.addView(list);
-        root.addView(sv, new LinearLayout.LayoutParams(
+        scroller = new ScrollView(this);
+        scroller.addView(list);
+        root.addView(scroller, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
         setContentView(root);
         SystemBars.pad(root);
+        if (saved != null) restoreScrollY = saved.getInt(STATE_SCROLL, -1);
+    }
+
+    @Override
+    protected void onSaveInstanceState(Bundle out) {
+        super.onSaveInstanceState(out);
+        out.putInt(STATE_SCROLL, scroller.getScrollY());
     }
 
     @Override
@@ -88,6 +104,15 @@ public final class LogsActivity extends Activity {
             this.file = f;
             this.modified = f.lastModified();
             this.length = f.length();
+            String key = f.getAbsolutePath();
+            Entry known;
+            synchronized (SUMMARIES) {
+                known = SUMMARIES.get(key);
+            }
+            if (known != null && known.length == length && known.modified == modified) {
+                this.summary = known.summary;
+                return;
+            }
             LogSummary s = null;
             try {
                 s = LogSummary.read(f);
@@ -95,30 +120,51 @@ public final class LogsActivity extends Activity {
                 // an unreadable file still gets a row; it just says less
             }
             this.summary = s;
+            synchronized (SUMMARIES) {
+                SUMMARIES.put(key, this);
+            }
         }
     }
 
-    private void build() {
-        list.removeAllViews();
+    /**
+     * Summaries already parsed, by path, for as long as the process lives.
+     *
+     * Every resume used to read every CSV in full, so coming back from a pack
+     * map re-parsed the lot. A file whose size and mtime are unchanged has the
+     * same summary; only the log being written, or a new one, is read again.
+     */
+    private static final Map<String, Entry> SUMMARIES = new HashMap<>();
 
-        TextView loading = new TextView(this);
-        loading.setText("Reading...");
-        loading.setTextSize(13);
-        loading.setTextColor(MUTED);
-        loading.setPadding(0, dp(24), 0, 0);
-        list.addView(loading);
+    private void build() {
+        // Only the first visit shows "Reading...". On a return the old rows stay
+        // up until the new ones replace them, so the list and its scroll
+        // position do not jump back to the top.
+        if (list.getChildCount() == 0) {
+            TextView loading = new TextView(this);
+            loading.setText("Reading...");
+            loading.setTextSize(13);
+            loading.setTextColor(MUTED);
+            loading.setPadding(0, dp(24), 0, 0);
+            list.addView(loading);
+        }
 
         new Thread(() -> {
             File dir = CsvLogger.logsDir(this);
             File[] all = dir.listFiles();
             ArrayList<Entry> csvs = new ArrayList<>();
+            Set<String> present = new HashSet<>();
             if (all != null) {
                 for (File f : all) {
                     if (f.isFile()
                             && f.getName().toLowerCase(Locale.ROOT).endsWith(".csv")) {
                         csvs.add(new Entry(f));
+                        present.add(f.getAbsolutePath());
                     }
                 }
+            }
+            // A deleted log's summary would otherwise stay cached for good.
+            synchronized (SUMMARIES) {
+                SUMMARIES.keySet().retainAll(present);
             }
             // Newest first: that is the drive you just did. Sorted on the stats
             // already gathered, so the comparator does no IO of its own.
@@ -135,6 +181,19 @@ public final class LogsActivity extends Activity {
     }
 
     private void show(Entry[] arr) {
+        final int y = restoreScrollY >= 0 ? restoreScrollY : scroller.getScrollY();
+        restoreScrollY = -1;
+        // Re-applied once the new rows are laid out: ScrollView clamps the
+        // offset to its content, and before that layout the content is the old
+        // list - or, after a recreation, the one "Reading..." line.
+        list.addOnLayoutChangeListener(new View.OnLayoutChangeListener() {
+            @Override
+            public void onLayoutChange(View v, int l, int t, int r, int b,
+                                       int ol, int ot, int or, int ob) {
+                v.removeOnLayoutChangeListener(this);
+                scroller.scrollTo(0, y);
+            }
+        });
         list.removeAllViews();
 
         if (BmsService.isActive()) {
@@ -169,7 +228,10 @@ public final class LogsActivity extends Activity {
             all.setTextSize(12.5f);
             all.setTextColor(OK);
             all.setPadding(0, dp(2), 0, dp(12));
+            all.setMinHeight(dp(48));
+            all.setGravity(Gravity.CENTER_VERTICAL);
             all.setOnClickListener(v -> shareAll(arr));
+            Ui.buttonRole(all);
             list.addView(all);
             // Two or more drives can be compared; one cannot.
             list.addView(historyRow(arr.length));
@@ -207,6 +269,8 @@ public final class LogsActivity extends Activity {
 
         row.setOnClickListener(v ->
                 startActivity(new Intent(this, PackHistoryActivity.class)));
+        // The whole row is the "Open →" control, read out as one button.
+        Ui.buttonRole(row);
         return row;
     }
 
@@ -243,6 +307,7 @@ public final class LogsActivity extends Activity {
 
         row.setOnClickListener(v ->
                 startActivity(new Intent(this, PackMapActivity.class)));
+        Ui.buttonRole(row);
         return row;
     }
 
@@ -287,7 +352,13 @@ public final class LogsActivity extends Activity {
         share.setTextSize(12.5f);
         share.setTextColor(Palette.SOFT);
         share.setPadding(dp(12), dp(8), dp(4), dp(8));
+        // A finger-sized target: the text alone made it about 33 dp tall.
+        share.setMinHeight(dp(48));
+        share.setMinWidth(dp(48));
+        share.setGravity(Gravity.CENTER);
+        share.setContentDescription("Share " + f.getName());
         share.setOnClickListener(v -> share(f));
+        Ui.buttonRole(share);
         row.addView(share);
 
         row.setOnClickListener(v -> {
@@ -299,6 +370,7 @@ public final class LogsActivity extends Activity {
             confirmDelete(f);
             return true;
         });
+        Ui.buttonRole(row);
         return row;
     }
 

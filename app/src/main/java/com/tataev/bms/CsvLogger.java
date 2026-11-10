@@ -97,7 +97,12 @@ final class CsvLogger {
         return rows;
     }
 
-    /** Start a new file. Safe to call when already open (no-op). */
+    /**
+     * Start a new file. Safe to call when already open (no-op).
+     *
+     * On failure nothing is left behind: no open writer and no file. The caller
+     * decides whether to try again; the service waits for the next connect.
+     */
     synchronized void start() throws IOException {
         if (writer != null) return;
         String stamp = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.ROOT).format(new Date());
@@ -110,17 +115,20 @@ final class CsvLogger {
         }
         bmsId = BmsFields.BMS_REQUEST;
         vin = prefs.profileVin(prefs.activeProfile());
-        writer = new FileWriter(f, false);
-        openPath = f.getAbsolutePath();
-        rows = 0;
         try {
+            writer = new FileWriter(f, false);
+            openPath = f.getAbsolutePath();
+            rows = 0;
             writeHeader();
         } catch (IOException e) {
             // Leaving the writer in place would look "open" forever: start() would
             // return early on every later call and every row would be appended to
             // a file with no header line, making the whole drive log unreadable by
-            // column name. Close it so the next poll genuinely retries.
+            // column name. And the file goes too: on a full disk it is 0 bytes or
+            // a cut-off header, which Logs would list as a drive.
             stop();
+            //noinspection ResultOfMethodCallIgnored
+            f.delete();
             throw e;
         }
     }

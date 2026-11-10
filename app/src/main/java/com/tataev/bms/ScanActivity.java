@@ -51,13 +51,14 @@ public final class ScanActivity extends Activity {
     private static volatile Thread worker;
     private static volatile boolean cancelledStatic;
     /**
-     * Whether the sweep that produced the stored results was cancelled.
+     * Whether the sweep that produced the stored results stopped short - by
+     * Stop, by leaving the screen, or by a lost link - so Apply asks first.
      *
      * cancelledStatic cannot answer that on a revisit: onDestroy sets it on the
      * way out, so a scan that ran to completion was re-displayed as "Stopped" the
      * next time the screen was opened.
      */
-    private static volatile boolean lastResultCancelled;
+    private static volatile boolean lastResultPartial;
     /**
      * Last status line, kept statically so a recreated screen can re-attach.
      *
@@ -113,6 +114,7 @@ public final class ScanActivity extends Activity {
         @Override
         public void run() {
             boolean running = isScanning();
+            showScanning(running);
             if (status != null && running) status.setText(lastStatus);
             if (startBtn != null) {
                 startBtn.setText(startButtonLabel());
@@ -131,6 +133,8 @@ public final class ScanActivity extends Activity {
      */
     private boolean sameCarConfirmed;
     private TextView status;
+    /** Shown only while a sweep runs. */
+    private TextView keepOpen;
     private TextView results;
     private Button startBtn;
     private EditText fromField;
@@ -149,8 +153,6 @@ public final class ScanActivity extends Activity {
     protected void onCreate(Bundle saved) {
         super.onCreate(saved);
         prefs = new Prefs(this);
-        getWindow().addFlags(
-                android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
         int pad = Math.round(12 * getResources().getDisplayMetrics().density);
         LinearLayout root = new LinearLayout(this);
@@ -190,6 +192,11 @@ public final class ScanActivity extends Activity {
         status = note(lastStatus);
         status.setTextColor(Palette.SOFT);
         root.addView(status);
+
+        keepOpen = note("Keep this screen open until the scan finishes");
+        keepOpen.setTextColor(Palette.WARN);
+        keepOpen.setVisibility(View.GONE);
+        root.addView(keepOpen);
 
         results = new TextView(this);
         results.setTextColor(Palette.TEXT);
@@ -261,8 +268,18 @@ public final class ScanActivity extends Activity {
         lastAnalysisNote = lastResultNote;
         showResults(lastResultHits,
                 lastResultSuggestion == null
-                        ? new java.util.LinkedHashMap<>() : lastResultSuggestion,
-                lastResultCancelled);
+                        ? new java.util.LinkedHashMap<>() : lastResultSuggestion);
+    }
+
+    /**
+     * Screen on, and the "keep this open" line, for exactly as long as a sweep
+     * runs. The sweep is a plain thread, not a foreground service, so on Android
+     * 14+ leaving the screen can freeze it silently; outside a sweep there is
+     * nothing to hold the display on for.
+     */
+    private void showScanning(boolean running) {
+        Ui.keepScreenOn(getWindow(), running);
+        if (keepOpen != null) keepOpen.setVisibility(running ? View.VISIBLE : View.GONE);
     }
 
     private void start() {
@@ -305,6 +322,7 @@ public final class ScanActivity extends Activity {
             worker.start();
         }
         startBtn.setText(startButtonLabel());
+        showScanning(true);
         results.setText("");
         setStatus("Connecting...");
     }
@@ -357,7 +375,9 @@ public final class ScanActivity extends Activity {
                         ? BmsFields.MSG_ADAPTER_SILENT : BmsFields.MSG_NO_REPLY);
                 return;
             }
-            elm.enterExtendedSession();
+            // Opt-in, as on the dashboard (Settings, Expert): off, the sweep
+            // reads in the default session the dashboard reads in.
+            if (prefs.extendedSession()) elm.enterExtendedSession();
             if (cancelledStatic) {
                 setStatus("Stopped");
                 return;
@@ -383,7 +403,12 @@ public final class ScanActivity extends Activity {
             }
             scanner.setAnchorCandidates(anchors);
             final android.os.PowerManager.WakeLock held = lock;
+            // Last DID of the last group fully asked: progress is reported after
+            // a group's reads, so a stop or a lost link leaves everything past
+            // this unasked.
+            final int[] reached = {from - 1};
             scanner.scan(elm, from, to, (did, hitCount, pct) -> {
+                reached[0] = Math.min(did + 2, to);
                 setStatus(String.format(Locale.ROOT, "Scanning %04X ... %d found (%d%%)",
                         did, hitCount, pct));
                 // Renew, do not just hold. A 0000-FFFF sweep is ~21,800 batched
@@ -401,16 +426,24 @@ public final class ScanActivity extends Activity {
             });
 
             List<DidScanner.Hit> hits = scanner.hits();
+            // Stopped short by the user (Stop, or leaving the screen). A tap
+            // after the last group finished leaves a complete sweep.
+            final boolean stopped = cancelledStatic && !scanner.linkLost() && reached[0] < to;
+            final boolean partial = stopped || scanner.linkLost();
             // Compute the hypotheses once and pass them on: the search is
             // O(n^3) over the voltage band and was previously run three times.
             DidScanner.Analysis analysis = DidScanner.analyse(hits);
             java.util.List<DidScanner.VoltageHypothesis> hyp = analysis.hypotheses;
             lastAnalysisNote = analysis.note();
-            if (scanner.linkLost()) {
-                String warn = String.format(Locale.ROOT, "LINK LOST at DID %04X: "
-                        + "the sweep was cut short and every DID after that point "
-                        + "was never asked. Treat these results as partial and "
-                        + "re-run the scan.", scanner.linkLostAtDid());
+            if (partial) {
+                String warn = scanner.linkLost()
+                        ? String.format(Locale.ROOT, "LINK LOST at DID %04X: "
+                                + "the sweep was cut short and every DID after that point "
+                                + "was never asked. Treat these results as partial and "
+                                + "re-run the scan.", scanner.linkLostAtDid())
+                        : String.format(Locale.ROOT, "STOPPED after DID %04X: every DID "
+                                + "after that point was never asked. Treat these results "
+                                + "as partial and re-run the scan to the end.", reached[0]);
                 lastAnalysisNote = lastAnalysisNote.isEmpty()
                         ? warn : warn + "\n" + lastAnalysisNote;
             }
@@ -427,26 +460,44 @@ public final class ScanActivity extends Activity {
             lastResultStatus = scanner.linkLost()
                     ? String.format(Locale.ROOT, "Link lost at %04X - partial results",
                             scanner.linkLostAtDid())
-                    : "Scan complete";
+                    : stopped
+                            ? String.format(Locale.ROOT, "Stopped after %04X - partial results",
+                                    reached[0])
+                            : "Scan complete";
             try {
                 String when = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.ROOT)
                         .format(new java.util.Date());
+                // The range actually asked, not the one requested: a stopped
+                // sweep used to say "Scanned: 0000-FFFF" and read as complete.
+                String scanned = !partial
+                        ? String.format(Locale.ROOT, "%04X-%04X", from, to)
+                        : reached[0] < from
+                                ? String.format(Locale.ROOT, "none of %04X-%04X (PARTIAL)",
+                                        from, to)
+                                : String.format(Locale.ROOT, "%04X-%04X of %04X-%04X (PARTIAL)",
+                                        from, reached[0], from, to);
                 // How identification went, as outcomes - never the VIN itself. A
                 // scan that looks VIN-less because the read was refused is a
                 // different story from one on a car that serves no VIN at all.
                 String preamble = String.format(Locale.ROOT,
-                        "Scanned: %04X-%04X\nWhen: %s\nApp: %s\nVIN read: %s\nSession: %s\n",
-                        from, to, when, CsvLogger.appVersion(this),
+                        "Scanned: %s\nWhen: %s\nApp: %s\nVIN read: %s\nSession: %s\n",
+                        scanned, when, CsvLogger.appVersion(this),
                         elm.lastVinReadOutcome(), elm.lastSessionOutcome())
                         + elm.caps().report();
+                String warning = scanner.linkLost()
+                        ? String.format(Locale.ROOT,
+                                "LINK LOST at DID %04X - PARTIAL RESULTS: every "
+                                + "DID after that point was never asked.",
+                                scanner.linkLostAtDid())
+                        : stopped
+                                ? String.format(Locale.ROOT,
+                                        "STOPPED after DID %04X - PARTIAL RESULTS: every "
+                                        + "DID after that point was never asked.",
+                                        reached[0])
+                                : "";
                 lastReport = DidScanner.writeReport(
                         CsvLogger.logsDir(this), bmsId, preamble, hits, suggestion, analysis,
-                        scanner.linkLost()
-                                ? String.format(Locale.ROOT,
-                                        "LINK LOST at DID %04X - PARTIAL RESULTS: every "
-                                        + "DID after that point was never asked.",
-                                        scanner.linkLostAtDid())
-                                : "");
+                        warning);
             } catch (Exception e) {
                 // A failed report must not lose the on-screen result - but the
                 // PREVIOUS sweep's file must not stand in for this one either:
@@ -454,9 +505,9 @@ public final class ScanActivity extends Activity {
                 lastReport = null;
             }
             lastResultReport = lastReport;
-            lastResultCancelled = cancelledStatic;
+            lastResultPartial = partial;
             resultsSerial++;
-            showResults(hits, suggestion, lastResultCancelled);
+            showResults(hits, suggestion);
         } catch (Exception e) {
             setStatus("Scan failed: " + e.getMessage());
         } finally {
@@ -467,7 +518,10 @@ public final class ScanActivity extends Activity {
                 } catch (RuntimeException ignored) {
                 }
             }
-            ui.post(() -> startBtn.setText(startButtonLabel()));
+            ui.post(() -> {
+                startBtn.setText(startButtonLabel());
+                showScanning(false);
+            });
             // The thread is held in a static field and its body captures this
             // Activity, so a finished thread left in that field pins the whole
             // dead view hierarchy until someone starts another scan. Nothing
@@ -476,8 +530,7 @@ public final class ScanActivity extends Activity {
         }
     }
 
-    private void showResults(List<DidScanner.Hit> hits, Map<String, String> suggestion,
-                             boolean cancelled) {
+    private void showResults(List<DidScanner.Hit> hits, Map<String, String> suggestion) {
         // isFinishing() alone misses a recreation (dark mode, font scale, a fold):
         // the old instance is destroyed with isFinishing() false. Same test as
         // MapScreen.gone(); the SDK_INT >= 17 guard it used to carry was dead at
@@ -490,10 +543,15 @@ public final class ScanActivity extends Activity {
         StringBuilder sb = new StringBuilder();
         sb.append(hits.size()).append(" DIDs answered\n");
         if (hits.isEmpty()) {
-            sb.append("Nothing answered across the whole range. Either the range "
-                    + "holds no data on this model, or the BMS address is wrong - "
-                    + "connect from the dashboard once so it is found again, then "
-                    + "scan.\n");
+            // The address is fixed, and the controller answered the check before
+            // the sweep began, so this is the range or the car - not where the
+            // app is looking.
+            sb.append("Nothing answered. The battery controller (").append(BmsFields.BMS_REQUEST)
+                    .append(") replied before the sweep, so this range may hold no data "
+                    + "on this model, or the car went to sleep part way. Keep the car "
+                    + "awake (ignition on), check the adapter is seated and lit, then "
+                    + "scan again or widen the range. If it stays empty, share the scan "
+                    + "report.\n");
         }
         sb.append('\n');
         sb.append("DID   len  sample   moves\n");
@@ -526,7 +584,7 @@ public final class ScanActivity extends Activity {
         ui.post(() -> {
             results.setText(text);
             showHypotheses();
-            setStatus(cancelled ? "Stopped" : lastResultStatus);
+            setStatus(lastResultStatus);
         });
     }
 
@@ -663,20 +721,21 @@ public final class ScanActivity extends Activity {
                     BmsFields.Field o = BmsFields.byKey(role);
                     switchedOff.add(o == null ? role : o.label);
                 }
-                if (!applyOverrides(m)) {
+                // The unit travels with the choice: a 10 mV controller's cells
+                // decode to millivolts through a scale override, so every
+                // downstream role keeps reading mV. The pack takes the built-in.
+                Map<String, String> scales = new java.util.HashMap<>();
+                if (h.cellUnitMv == 10) {
+                    scales.put("cell_max_mv", "10;0;2");
+                    scales.put("cell_min_mv", "10;0;2");
+                }
+                if (!applyOverrides(m, scales)) {
                     for (String role : plan.disable) {
                         prefs.setDidOverride(role, priorDid.get(role));
                         prefs.setScaleOverride(role, priorScale.get(role));
                     }
                     return;
                 }
-                // The unit travels with the choice: a 10 mV controller's cells
-                // decode to millivolts through a scale override, so every
-                // downstream role keeps reading mV.
-                String cellScale = h.cellUnitMv == 10 ? "10;0;2" : "";
-                prefs.setScaleOverride("cell_max_mv", cellScale);
-                prefs.setScaleOverride("cell_min_mv", cellScale);
-                prefs.setScaleOverride("pack_v", "");
                 Toast.makeText(this, String.format(Locale.ROOT,
                         "Set pack=%s, max=%s, min=%s (%.0f groups%s)%s",
                         h.packDid, h.cellMaxDid, h.cellMinDid, h.series,
@@ -738,8 +797,8 @@ public final class ScanActivity extends Activity {
                 if (refuseWhileLive()) return;
                 Map<String, String> m = new java.util.LinkedHashMap<>();
                 m.put("soc_pct", h.did);
-                if (applyOverrides(m)) {
-                    prefs.setScaleOverride("soc_pct", "1;0;" + h.length);
+                if (applyOverrides(m, java.util.Collections.singletonMap(
+                        "soc_pct", "1;0;" + h.length))) {
                     Toast.makeText(this, "SOC = " + h.did + " in whole percent",
                             Toast.LENGTH_LONG).show();
                 }
@@ -767,8 +826,8 @@ public final class ScanActivity extends Activity {
                 if (refuseWhileLive()) return;
                 Map<String, String> m = new java.util.LinkedHashMap<>();
                 m.put("soc_pct", h.did);
-                if (applyOverrides(m)) {
-                    prefs.setScaleOverride("soc_pct", "0.1;0;2");
+                if (applyOverrides(m, java.util.Collections.singletonMap(
+                        "soc_pct", "0.1;0;2"))) {
                     Toast.makeText(this, "SOC = " + h.did + " in tenths of a percent",
                             Toast.LENGTH_LONG).show();
                 }
@@ -783,9 +842,27 @@ public final class ScanActivity extends Activity {
             return;
         }
         if (refuseWhileLive()) return;
+        if (lastResultPartial) {
+            // A suggestion from part of the range can name a weaker candidate
+            // than one the sweep never reached.
+            new AlertDialog.Builder(this)
+                    .setTitle("Apply a partial scan?")
+                    .setMessage("This sweep stopped before the end of its range, so "
+                            + "DIDs past that point were never asked and a better "
+                            + "match may be among them. Re-running the scan to the "
+                            + "end is safer.")
+                    .setPositiveButton("Apply anyway", (d, w) -> applySuggestionNow())
+                    .setNegativeButton("Cancel", null)
+                    .show();
+            return;
+        }
+        applySuggestionNow();
+    }
+
+    private void applySuggestionNow() {
         // Drop the roles that collide instead of refusing the whole apply. A
         // suggestion can name a DID an earlier pick already gave to
-        // another role - 3421 read as SOH on a car where it is SOC - and
+        // another role - it once named 3421 as SOH on a car where it is SOC - and
         // refusing everything for that left the temperatures unmappable too.
         Map<String, String> others = new java.util.LinkedHashMap<>();
         for (BmsFields.Field f : BmsFields.ALL) {
@@ -801,7 +878,9 @@ public final class ScanActivity extends Activity {
                     Toast.LENGTH_LONG).show();
             return;
         }
-        if (applyOverrides(kept)) {
+        // No implied scales: every role suggest() names is read with its
+        // built-in decoding, so any older one-tap override on it is cleared.
+        if (applyOverrides(kept, null)) {
             Toast.makeText(this, kept.size() + " DIDs mapped"
                     + (skipped.isEmpty() ? "" : ", skipped: " + android.text.TextUtils.join(", ", skipped)),
                     Toast.LENGTH_LONG).show();
@@ -875,9 +954,16 @@ public final class ScanActivity extends Activity {
      * default, so checking only the incoming set is not enough - the check has to
      * be against the map that will actually be in force.
      *
+     * Each role's scale override is written with its DID (see
+     * DidScanner.scalesOnApply): a DID applied under an older pick's scale
+     * decodes as the wrong unit.
+     *
+     * @param impliedScales role -> the scale the pick implies; null, or a role
+     *                      left out, clears that role's override
      * @return true if everything was written
      */
-    private boolean applyOverrides(Map<String, String> wanted) {
+    private boolean applyOverrides(Map<String, String> wanted,
+                                   Map<String, String> impliedScales) {
         if (isScanning()) {
             // The static store still holds the PREVIOUS sweep's results while a
             // new one runs; applying them mid-sweep would pair old results with
@@ -923,6 +1009,10 @@ public final class ScanActivity extends Activity {
         }
         for (Map.Entry<String, String> e : wanted.entrySet()) {
             prefs.setDidOverride(e.getKey(), e.getValue());
+        }
+        for (Map.Entry<String, String> e
+                : DidScanner.scalesOnApply(wanted, impliedScales).entrySet()) {
+            prefs.setScaleOverride(e.getKey(), e.getValue());
         }
         return true;
     }

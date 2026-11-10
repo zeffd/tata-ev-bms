@@ -28,6 +28,8 @@ abstract class MapScreen extends Activity {
     TextView footnote;
     /** One row per named finding, above the grid. */
     LinearLayout findingsBox;
+    /** A subclass's own links, under the stats; empty unless one adds a row. */
+    LinearLayout extras;
 
     /**
      * The header title. Called from onCreate BEFORE onReady(), so it may depend
@@ -72,6 +74,13 @@ abstract class MapScreen extends Activity {
         stats.setLineSpacing(0, 1.35f);
         stats.setPadding(dp(16), dp(6), dp(16), dp(12));
         body.addView(stats);
+
+        // Between the numbers and the findings. The findings box is rebuilt on
+        // every live refresh; this is not, so a link put here stays put.
+        extras = new LinearLayout(this);
+        extras.setOrientation(LinearLayout.VERTICAL);
+        extras.setPadding(dp(16), 0, dp(16), dp(6));
+        body.addView(extras);
 
         // The verdicts in words, before the picture. The map coloured squares
         // and the summary listed pack-level numbers, but nothing named WHICH

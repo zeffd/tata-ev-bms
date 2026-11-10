@@ -23,7 +23,6 @@ import android.provider.Settings;
 import android.text.TextUtils;
 import android.view.Gravity;
 import android.view.View;
-import android.view.WindowManager;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.ScrollView;
@@ -75,6 +74,8 @@ public final class MainActivity extends Activity {
     private TextView alertView;
     /** Calibration hint: amber, not red - nothing about the pack is wrong. */
     private TextView hintView;
+    /** "Share the poll report" after a link that decoded nothing; above the hint. */
+    private TextView reportView;
     /**
      * A failure with what to do about it: what to check when the controller at
      * 785 did not reply, a Map button when it answered in unknown codes.
@@ -102,16 +103,26 @@ public final class MainActivity extends Activity {
     private long lastToggleMs;
     /** Whether the pending permission request came from the user pressing something. */
     private boolean permissionAskWasUserGesture;
-    /** Auto-connect is once per launch: a Stop must stay stopped when the user comes back. */
+    /**
+     * Auto-connect is once per launch: a Stop must stay stopped when the user
+     * comes back. Saved with the instance state, or a recreation (dark mode,
+     * font scale) after a Stop counted as a new launch and reconnected.
+     */
     private boolean autoConnectTried;
+    private static final String STATE_AUTO_TRIED = "auto_connect_tried";
 
     private final List<String> tileKeys = new ArrayList<>();
     private final List<TextView> tileValues = new ArrayList<>();
     /** The fields behind the tiles, and the captions naming the DID each is read from. */
     private final List<BmsFields.Field> tileFields = new ArrayList<>();
     private final List<TextView> tileDids = new ArrayList<>();
-    /** What tapping the hint line does right now; it carries two different offers. */
-    private Runnable hintAction;
+    /** Grid-tile texts that shrink to fit, with the sp size each is designed at. */
+    /** Per tile text: {current cap, floor} in sp. The cap only ever comes down. */
+    private final java.util.Map<TextView, float[]> fitSp = new java.util.HashMap<>();
+    /** Width inside a grid tile's padding, in px. */
+    private int tileTextPx;
+    /** The poll report the offer line shares, as of the last refresh. */
+    private String shownReport;
 
     private final BroadcastReceiver updates = new BroadcastReceiver() {
         @Override
@@ -136,6 +147,7 @@ public final class MainActivity extends Activity {
     protected void onCreate(Bundle saved) {
         super.onCreate(saved);
         prefs = new Prefs(this);
+        if (saved != null) autoConnectTried = saved.getBoolean(STATE_AUTO_TRIED, false);
         View root = buildUi();
         setContentView(root);
         // Android 15 draws the window behind the system bars, so without this the
@@ -153,11 +165,17 @@ public final class MainActivity extends Activity {
      * screen - on a phone sitting in a car dock, indefinitely.
      */
     private void updateScreenOnFlag() {
-        if (isLive()) {
-            getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        } else {
-            getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        }
+        Ui.keepScreenOn(getWindow(), isLive());
+    }
+
+    @Override
+    protected void onSaveInstanceState(Bundle out) {
+        super.onSaveInstanceState(out);
+        // Only across a recreation (theme, font scale): Stop must stay stopped.
+        // The same Bundle also survives the process being killed in the
+        // background, and an owner coming back to the car hours later expects
+        // the auto-connect the setting promises.
+        if (isChangingConfigurations()) out.putBoolean(STATE_AUTO_TRIED, autoConnectTried);
     }
 
     @Override
@@ -242,23 +260,14 @@ public final class MainActivity extends Activity {
         alertLp.setMargins(side, 0, side, dp(8));
         content.addView(alertView, alertLp);
 
-        hintView = new TextView(this);
-        hintView.setTextSize(12.5f);
-        hintView.setTextColor(WARN);
-        hintView.setLineSpacing(0, 1.2f);
-        hintView.setPadding(dp(14), dp(10), dp(14), dp(10));
-        hintView.setBackground(pressable(TILE, dp(8)));
-        hintView.setVisibility(View.GONE);
-        hintView.setOnClickListener(v -> {
-            Runnable a = hintAction;
-            if (a != null) a.run();
+        // The poll-report offer, and the calibration hint under it. One line used
+        // to carry either, and a hint left from the last link hid the report
+        // that explains why this one decoded nothing.
+        reportView = addHintLine(content, side, v -> {
+            String p = shownReport;
+            if (p != null) shareFile(p, "Share poll report");
         });
-        Ui.buttonRole(hintView);
-        LinearLayout.LayoutParams hintLp = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT);
-        hintLp.setMargins(side, 0, side, dp(8));
-        content.addView(hintView, hintLp);
+        hintView = addHintLine(content, side, v -> offerZeroFix());
 
         troubleBox = new LinearLayout(this);
         troubleBox.setOrientation(LinearLayout.VERTICAL);
@@ -285,6 +294,25 @@ public final class MainActivity extends Activity {
 
         root.addView(buildFooter(side));
         return root;
+    }
+
+    /** A tappable one-paragraph offer under the alert banner, hidden until used. */
+    private TextView addHintLine(LinearLayout content, int side, View.OnClickListener tap) {
+        TextView line = new TextView(this);
+        line.setTextSize(12.5f);
+        line.setTextColor(WARN);
+        line.setLineSpacing(0, 1.2f);
+        line.setPadding(dp(14), dp(10), dp(14), dp(10));
+        line.setBackground(pressable(TILE, dp(8)));
+        line.setVisibility(View.GONE);
+        line.setOnClickListener(tap);
+        Ui.buttonRole(line);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        lp.setMargins(side, 0, side, dp(8));
+        content.addView(line, lp);
+        return line;
     }
 
     private View buildHeader(int side) {
@@ -462,6 +490,7 @@ public final class MainActivity extends Activity {
         int gap = dp(8);
         int usable = getResources().getDisplayMetrics().widthPixels - side * 2;
         int size = (usable - gap * (COLUMNS - 1)) / COLUMNS;
+        tileTextPx = size - dp(11) * 2;         // tile() pads 11 dp each side
 
         LinearLayout grid = new LinearLayout(this);
         grid.setOrientation(LinearLayout.VERTICAL);
@@ -502,6 +531,7 @@ public final class MainActivity extends Activity {
         label.setTextSize(9.5f);
         label.setTextColor(MUTED);
         label.setLetterSpacing(0.1f);
+        fitToTile(label, 9.5f);
         box.addView(label);
 
         box.addView(new View(this), new LinearLayout.LayoutParams(
@@ -512,6 +542,7 @@ public final class MainActivity extends Activity {
         value.setTextSize(25);
         value.setTextColor(TEXT);
         value.setTypeface(Typeface.create("sans-serif-condensed", Typeface.BOLD));
+        fitToTile(value, 25f);
         box.addView(value);
 
         TextView did = new TextView(this);
@@ -519,6 +550,7 @@ public final class MainActivity extends Activity {
         did.setTextSize(8.5f);
         did.setTextColor(FAINT);
         did.setTypeface(Typeface.MONOSPACE);
+        fitToTile(did, 8.5f);
         box.addView(did);
 
         tileKeys.add(f.key);
@@ -526,6 +558,20 @@ public final class MainActivity extends Activity {
         tileFields.add(f);
         tileDids.add(did);
         return box;
+    }
+
+    /**
+     * One line, shrunk to the tile's width. The tiles are fixed-pixel squares
+     * and their text is sp, so at a large font scale it wrapped or ran off the
+     * edge; set() refits whenever the text changes, never growing back, so
+     * a current flipping between -9.8 and -10.2 keeps one size.
+     */
+    private void fitToTile(TextView v, float sp) {
+        v.setSingleLine(true);
+        v.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        float[] fit = {sp, sp * 0.6f};
+        fit[0] = Ui.fitText(v, fit[0], fit[1], tileTextPx);
+        fitSp.put(v, fit);
     }
 
     /**
@@ -664,7 +710,7 @@ public final class MainActivity extends Activity {
      * second, which on a phone in a hot car is heat and battery for nothing. Most
      * of these strings change rarely or never.
      */
-    private static void set(TextView v, CharSequence text) {
+    private void set(TextView v, CharSequence text) {
         if (v == null) return;
         CharSequence cur = v.getText();
         if (cur != null && cur.length() == text.length()
@@ -672,6 +718,8 @@ public final class MainActivity extends Activity {
             return;
         }
         v.setText(text);
+        float[] fit = fitSp.get(v);
+        if (fit != null) fit[0] = Ui.fitText(v, fit[0], fit[1], tileTextPx);
     }
 
     private void refresh() {
@@ -717,8 +765,8 @@ public final class MainActivity extends Activity {
         }
         spinner.setVisibility(connecting ? View.VISIBLE : View.GONE);
         statusDot.setVisibility(connecting ? View.GONE : View.VISIBLE);
-        // Share and Settings would fight the connect attempt for a
-        // single-connection adapter, so they wait until the link settles.
+        // Settings waits until the link settles. Logs stays open throughout:
+        // it only reads files, and the connect-retry loop can run a minute.
         setControlsEnabled(!connecting);
         // Recording is stricter: it only means anything while the BMS is actually
         // answering. Enabling it while disconnected just set a preference that
@@ -762,21 +810,24 @@ public final class MainActivity extends Activity {
             updatingUi = false;
         }
 
+        // Each on its own line, so neither hides the other.
         String hint = BmsService.calibrationHint();
         String poll = BmsService.pollReportPath();
-        if (!hint.isEmpty()) {
-            set(hintView, hint);
-            hintAction = this::offerZeroFix;
-            hintView.setVisibility(View.VISIBLE);
-        } else if (r == null && poll != null) {
+        if (r == null && poll != null) {
             // Nothing on the dashboard and a transcript explaining why. Offered
             // here as well as on the trouble card, because the empty-poll exit
             // reconnects rather than raising a card.
-            set(hintView, "Nothing decoded on the last link. Share the poll report.");
-            hintAction = () -> shareFile(poll, "Share poll report");
+            set(reportView, "Nothing decoded on the last link. Share the poll report.");
+            shownReport = poll;
+            reportView.setVisibility(View.VISIBLE);
+        } else {
+            shownReport = null;
+            reportView.setVisibility(View.GONE);
+        }
+        if (!hint.isEmpty()) {
+            set(hintView, hint);
             hintView.setVisibility(View.VISIBLE);
         } else {
-            hintAction = null;
             hintView.setVisibility(View.GONE);
         }
 
@@ -970,9 +1021,15 @@ public final class MainActivity extends Activity {
                     + "Tata's own diagnostic tool, answers at " + BmsFields.BMS_REQUEST
                     + ": Nexon EV, Tiago.ev, Punch.ev, Curvv.ev and Tigor EV.");
         } else {
+            // Some controllers serve their data only in the extended session, and
+            // refuse it outside exactly as an unmapped car does. That session is
+            // opt-in now, so try the switch before a few minutes of scanning.
             text.setText("This car's battery controller answers, but not with the codes this "
                     + "app knows. Mapping it reads every code the controller serves and "
-                    + "suggests which is which. It takes a few minutes with the car awake.");
+                    + "suggests which is which. It takes a few minutes with the car awake."
+                    + (prefs.extendedSession() ? "" : "\n\nIf this app has never read this "
+                    + "car, first try Settings - Expert - Extended diagnostic session, "
+                    + "then connect again."));
             TextView go = flatButton("Map this car", OK,
                     v -> startActivity(new Intent(this, ScanActivity.class)));
             LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
@@ -1012,11 +1069,8 @@ public final class MainActivity extends Activity {
 
     /** Grey out and detach anything that must not be touched mid-connect. */
     private void setControlsEnabled(boolean enabled) {
-        shareButton.setEnabled(enabled);
         settingsButton.setEnabled(enabled);
-        int c = enabled ? Palette.SOFT : FAINT;
-        shareButton.setTextColor(c);
-        settingsButton.setTextColor(c);
+        settingsButton.setTextColor(enabled ? Palette.SOFT : FAINT);
     }
 
     /** Recording is only meaningful while the BMS is answering. */
