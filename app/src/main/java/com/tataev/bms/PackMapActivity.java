@@ -4,9 +4,12 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.graphics.Typeface;
 import android.os.Build;
+import android.view.Gravity;
 import android.view.View;
-import android.view.WindowManager;
+import android.widget.LinearLayout;
+import android.widget.TextView;
 import android.widget.Toast;
 
 import java.io.File;
@@ -127,6 +130,51 @@ public final class PackMapActivity extends MapScreen {
         } else {
             readout.setText("Read " + res.rows + " rows. Tap a group.");
         }
+        if (res.rows > 0 && extras.getChildCount() == 0) extras.addView(curveRow());
+    }
+
+    /** The same log against SOC: when in the charge a group was the weakest. */
+    private View curveRow() {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setBackground(Ui.pressable(Palette.TILE, dp(8)));
+        row.setPadding(dp(14), dp(12), dp(14), dp(12));
+
+        LinearLayout text = new LinearLayout(this);
+        text.setOrientation(LinearLayout.VERTICAL);
+        TextView t = new TextView(this);
+        t.setText("Drive curve");
+        t.setTextSize(15);
+        t.setTextColor(Palette.TEXT);
+        t.setTypeface(Typeface.DEFAULT_BOLD);
+        text.addView(t);
+        TextView s = new TextView(this);
+        s.setText("cells and weakest group against SOC");
+        s.setTextSize(11.5f);
+        s.setTextColor(Palette.MUTED);
+        text.addView(s);
+        row.addView(text, new LinearLayout.LayoutParams(0,
+                LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+
+        TextView go = new TextView(this);
+        go.setText("Open →");
+        go.setTextSize(13);
+        go.setTextColor(Palette.OK);
+        row.addView(go);
+
+        row.setOnClickListener(v -> {
+            Intent i = new Intent(this, DriveCurveActivity.class);
+            i.putExtra(EXTRA_LOG_PATH, path());
+            startActivity(i);
+        });
+        Ui.buttonRole(row);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        lp.setMargins(0, 0, 0, dp(8));
+        row.setLayoutParams(lp);
+        return row;
     }
 
     @Override
@@ -163,11 +211,7 @@ public final class PackMapActivity extends MapScreen {
      * would drain a docked phone for nothing.
      */
     private void updateScreenOnFlag() {
-        if (live && BmsService.isActive()) {
-            getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        } else {
-            getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        }
+        Ui.keepScreenOn(getWindow(), live && BmsService.isActive());
     }
 
     private void refresh() {

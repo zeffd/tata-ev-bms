@@ -190,13 +190,12 @@ final class PackHistory {
     }
 
     static Result aggregate(List<PackMap> maps) {
-        int samples = 0, series = 0, first = 1;
+        int samples = 0, first = 1;
         for (PackMap m : maps) {
             samples += m.samples();
-            series = Math.max(series, m.seriesCount());
             first = Math.min(first, m.firstIndex());
         }
-        Result r = new Result(maps.size(), samples, maps.isEmpty() ? 0 : series, first);
+        Result r = new Result(maps.size(), samples, seriesCount(maps), first);
         for (PackMap m : maps) {
             for (int i = m.firstIndex(); i <= m.lastIndex(); i++) {
                 PackMap.Snapshot s = m.snapshot(i);
@@ -222,6 +221,31 @@ final class PackHistory {
             }
         }
         return r;
+    }
+
+    /**
+     * The pack's group count across drives: the most common among the drives
+     * whose count settled, the larger on a tie. A short drive that never
+     * settled replays as 105-106 on a 104-group pack, and the maximum gave the
+     * whole history phantom UNSEEN groups. The maximum stays only as the
+     * fallback when no drive settled.
+     */
+    private static int seriesCount(List<PackMap> maps) {
+        Map<Integer, Integer> votes = new java.util.HashMap<>();
+        int best = 0, bestVotes = 0, max = 0;
+        for (PackMap m : maps) {
+            int n = m.seriesCount();
+            max = Math.max(max, n);
+            if (!m.countSettled()) continue;
+            Integer v = votes.get(n);
+            int c = v == null ? 1 : v + 1;
+            votes.put(n, c);
+            if (c > bestVotes || (c == bestVotes && n > best)) {
+                best = n;
+                bestVotes = c;
+            }
+        }
+        return bestVotes > 0 ? best : max;
     }
 
     private static int rank(PackMap.State s) {

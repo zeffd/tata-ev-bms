@@ -2,9 +2,11 @@ package com.tataev.bms;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * ISO-TP reassembly and UDS response decoding for ELM327 text output.
@@ -55,13 +57,25 @@ final class UdsCodec {
         final int nrc;          // meaningful only when negative
         final String did;       // e.g. "3402", null for negative replies
         final byte[] data;      // payload after the DID
+        /**
+         * A multi-frame reply whose consecutive frames never all arrived. Still
+         * surfaced as data - a reading's leading bytes are better than none - but
+         * never an identity: a truncated serial is a different car's name.
+         */
+        final boolean partial;
 
         Response(String canId, boolean negative, int nrc, String did, byte[] data) {
+            this(canId, negative, nrc, did, data, false);
+        }
+
+        Response(String canId, boolean negative, int nrc, String did, byte[] data,
+                 boolean partial) {
             this.canId = canId;
             this.negative = negative;
             this.nrc = nrc;
             this.did = did;
             this.data = data;
+            this.partial = partial;
         }
 
         boolean isData() {
@@ -113,6 +127,11 @@ final class UdsCodec {
      * shape this app ever sees, because 785 is the only address it targets.
      */
     static Map<String, List<byte[]>> reassembleAll(String text) {
+        return reassembleAll(text, null);
+    }
+
+    /** @param partialIds when non-null, receives the ids answered only by a partial */
+    private static Map<String, List<byte[]>> reassembleAll(String text, Set<String> partialIds) {
         final int idLen = 3;
         Map<String, List<byte[]>> out = new HashMap<>();
         Map<String, byte[]> partialBuf = new HashMap<>();
@@ -211,6 +230,7 @@ final class UdsCodec {
             if (e.getValue() == null || e.getValue().length == 0) continue;
             if (out.containsKey(e.getKey())) continue;
             addTo(out, e.getKey(), e.getValue());
+            if (partialIds != null) partialIds.add(e.getKey());
         }
         return out;
     }
@@ -239,8 +259,12 @@ final class UdsCodec {
      * response on the same ID; the pending frame must not mask the real one.
      */
     static Map<String, byte[]> reassemble(String text) {
+        return reassemble(text, null);
+    }
+
+    private static Map<String, byte[]> reassemble(String text, Set<String> partialIds) {
         Map<String, byte[]> best = new HashMap<>();
-        for (Map.Entry<String, List<byte[]>> e : reassembleAll(text).entrySet()) {
+        for (Map.Entry<String, List<byte[]>> e : reassembleAll(text, partialIds).entrySet()) {
             byte[] pick = null;
             for (byte[] p : e.getValue()) {
                 if (!isResponsePending(p)) pick = p;      // last real answer wins
@@ -285,7 +309,8 @@ final class UdsCodec {
      */
     static Response decode22(String text, String expectedId) {
         if (expectedId == null) return null;
-        byte[] payload = reassemble(text).get(expectedId);
+        Set<String> partialIds = new HashSet<>();
+        byte[] payload = reassemble(text, partialIds).get(expectedId);
         if (payload == null || payload.length == 0) return null;
 
         if ((payload[0] & 0xFF) == 0x7F) {
@@ -297,7 +322,8 @@ final class UdsCodec {
                     payload[1] & 0xFF, payload[2] & 0xFF);
             byte[] data = new byte[payload.length - 3];
             System.arraycopy(payload, 3, data, 0, data.length);
-            return new Response(expectedId, false, -1, did, data);
+            return new Response(expectedId, false, -1, did, data,
+                    partialIds.contains(expectedId));
         }
         return null;
     }
@@ -338,6 +364,23 @@ final class UdsCodec {
         }
         if (pos != payload.length) return null;         // leftover bytes: distrust
         return out.isEmpty() ? null : out;
+    }
+
+    /**
+     * An ASCII identification reply as text, trimmed; null when there is none.
+     *
+     * A partial reply is none: its first frame alone reads as a shorter serial,
+     * which would key the car as one no profile knows.
+     */
+    static String idString(Response r) {
+        if (r == null || !r.isData() || r.partial) return null;
+        StringBuilder sb = new StringBuilder();
+        for (byte b : r.data) {
+            int c = b & 0xFF;
+            if (c >= 32 && c < 127) sb.append((char) c);
+        }
+        String s = sb.toString().trim();
+        return s.isEmpty() ? null : s;
     }
 
     static String toHex(byte[] b) {

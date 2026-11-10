@@ -8,27 +8,55 @@ android {
         applicationId "com.tataev.bms"
         minSdk 24
         targetSdk 35
-        versionCode 41
-        versionName "1.3"
+        versionCode 42
+        versionName "1.4"
+    }
+
+    // A fixed release key, when the environment provides one (CI does, from
+    // repository secrets - see README "Signing releases"). Android only
+    // installs an update signed by the same key as the installed app, so
+    // without this every machine - and every CI runner - signed with its own
+    // fresh debug key, and each update meant an uninstall that took the
+    // on-device logs with it.
+    def releaseKeystore = System.getenv("RELEASE_KEYSTORE")
+    def releaseStorePassword = System.getenv("RELEASE_KEYSTORE_PASSWORD")
+    def releaseKeyAlias = System.getenv("RELEASE_KEY_ALIAS")
+    def releaseKeyPassword = System.getenv("RELEASE_KEY_PASSWORD")
+    def releaseVars = [releaseKeystore, releaseStorePassword, releaseKeyAlias, releaseKeyPassword]
+    def haveReleaseKey = releaseVars.every { it != null && !it.isEmpty() }
+    // Some set but not all is a typo, not a choice: falling back to debug would
+    // quietly sign with the wrong key and break the update chain the key is for.
+    if (!haveReleaseKey && releaseVars.any { it != null && !it.isEmpty() }) {
+        throw new GradleException("RELEASE_KEYSTORE, RELEASE_KEYSTORE_PASSWORD, "
+                + "RELEASE_KEY_ALIAS and RELEASE_KEY_PASSWORD must all be set, or none")
+    }
+
+    signingConfigs {
+        if (haveReleaseKey) {
+            release {
+                storeFile file(releaseKeystore)
+                storePassword releaseStorePassword
+                keyAlias releaseKeyAlias
+                keyPassword releaseKeyPassword
+            }
+        }
     }
 
     buildTypes {
         release {
-            // Both of these are deliberate for a SIDELOADED diagnostic tool, and
-            // both must change before this goes anywhere else:
+            // Both of these are deliberate for a SIDELOADED diagnostic tool:
             //
             //  * minifyEnabled false - a ~125 KB APK gains almost nothing from R8,
             //    and an obfuscated stack trace from a car park is worth less than
             //    the few KB saved.
-            //  * signingConfig debug - lets a release build install straight from
-            //    `adb install` with no keystore ceremony. It also means every
-            //    machine that builds this produces a DIFFERENT signature, so a
-            //    rebuild elsewhere forces an uninstall, taking the logs with it.
-            //
-            // For distribution: a real keystore, and minify with a keep rule for
-            // anything reached reflectively.
+            //  * signingConfig - the release key when all four RELEASE_* variables
+            //    are set, otherwise debug, so a local build still installs
+            //    straight from `adb install` with no keystore ceremony. A
+            //    debug-signed build carries THAT machine's key: installing it
+            //    over a release-signed app (or the reverse) needs an uninstall,
+            //    which takes the logs with it.
             minifyEnabled false
-            signingConfig signingConfigs.debug
+            signingConfig haveReleaseKey ? signingConfigs.release : signingConfigs.debug
         }
     }
 

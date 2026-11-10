@@ -18,8 +18,9 @@ import java.util.UUID;
  * Talks to a Bluetooth ELM327 over RFCOMM and speaks just enough UDS to read
  * the Nexon EV Max BMS.
  *
- * READ-ONLY: only ELM327 AT setup, UDS 0x22 reads, the 0x10 0x03 session mode
- * switch and the 0x3E keep-alive are ever transmitted. Write, clear, reset,
+ * READ-ONLY: only ELM327 AT setup, UDS 0x22 reads, the 0x10 session switches
+ * and the 0x3E keep-alive are ever transmitted, and UDS only once the adapter
+ * has confirmed the battery controller's address. Write, clear, reset,
  * routine, IO-control and SecurityAccess requests are rejected outright.
  */
 final class ElmClient {
@@ -135,6 +136,19 @@ final class ElmClient {
     /** What the adapter answered during setup, for the report headers. */
     private final AdapterCaps caps = new AdapterCaps();
 
+    /** Header, reset and prompt state of this link; every write asks it first. */
+    private final LinkGate gate = new LinkGate();
+    /** How long the resync space may take to bring back a prompt. */
+    private static final long RESYNC_MS = 1000;
+    /** ATZ brought no prompt back, so nothing else is written on this link. */
+    private boolean adapterSilent;
+    /** The ECU acknowledged 1003 on this link, so 1001 on close is owed. */
+    private boolean sessionOpened;
+
+    /** Why the link is dropped when the adapter resets itself mid-session. */
+    private static final String MSG_ADAPTER_RESET =
+            "The OBD adapter restarted itself - reconnecting";
+
     /**
      * The last few exchanges, for the poll report.
      *
@@ -186,7 +200,11 @@ final class ElmClient {
             recent.clear();       // a new link's report is about THIS link
         }
         lastVinReadOutcome = "";
-        lastSessionOutcome = "";
+        // Said, not blank: with the session opt-in, "never asked" is the normal case.
+        lastSessionOutcome = "not requested";
+        gate.reset();
+        adapterSilent = false;
+        sessionOpened = false;
         // aborted is NOT cleared here. It is set only by abort(), whose one
         // caller is BmsService.onDestroy - the service is going away and the
         // worker is being joined, so nothing legitimately connects again on this
@@ -234,6 +252,10 @@ final class ElmClient {
      * Refuses anything {@link CommandGuard} does not allow: this is the choke
      * point that enforces read-only, so a typo like 2E or 1002 cannot reach the
      * car, and neither can a second command smuggled in after a CR.
+     *
+     * Then asks {@link LinkGate}: no UDS request before the adapter confirmed
+     * ATSH785, none after it reset itself, and nothing at all while it still
+     * owes the prompt from the last command.
      */
     String raw(String cmd, long timeoutMs) throws IOException {
         // Snapshot the streams: abort() can null them from another thread at any
@@ -245,14 +267,70 @@ final class ElmClient {
         if (!CommandGuard.isAllowed(cmd)) {
             throw new IOException("refusing to transmit non-read command: " + cmd);
         }
-        // Drain anything stale so a slow previous reply cannot be misread as ours.
-        byte[] drain = new byte[512];
-        while (in.available() > 0) {
-            if (in.read(drain, 0, Math.min(in.available(), drain.length)) <= 0) break;
+        // Drain anything stale so a slow previous reply cannot be misread as ours
+        // - but read it first: a late prompt means the adapter is idle again, and
+        // a banner means it reset itself and is back on the broadcast header.
+        LinkGate.Verdict v = gate.beforeWrite(cmd, drain(in));
+        if (v == LinkGate.Verdict.RESYNC) {
+            // A lone space: it interrupts a busy adapter (which then prints
+            // STOPPED and its prompt) and is ignored by an idle one. Never a bare
+            // CR, which the ELM327 takes as "repeat the last command".
+            out.write(' ');
+            out.flush();
+            v = gate.afterResync(readReply(in, RESYNC_MS));
+        }
+        switch (v) {
+            case PROCEED:
+                break;
+            case RESET:
+                Log.w(TAG, "adapter reset detected before " + cmd);
+                record(cmd, "(not sent: the adapter reset itself)");
+                throw new IOException(MSG_ADAPTER_RESET);
+            case UNADDRESSED:
+                throw new IOException("refusing " + cmd + " before the adapter confirmed "
+                        + "the battery controller's address");
+            default:
+                record(cmd, "(not sent: the adapter is still busy)");
+                throw new IOException("The OBD adapter stopped responding");
         }
         out.write((cmd + "\r").getBytes(StandardCharsets.US_ASCII));
         out.flush();
 
+        String got = readReply(in, timeoutMs);
+        if (gate.afterReply(cmd, got) == LinkGate.Verdict.RESET) {
+            Log.w(TAG, "adapter reset detected in the reply to " + cmd);
+            record(cmd, "(the adapter reset itself)");
+            throw new IOException(MSG_ADAPTER_RESET);
+        }
+        String text = got.replace(">", "");
+        StringBuilder cleaned = new StringBuilder();
+        for (String line : text.replace('\r', '\n').split("\n")) {
+            String t = line.trim();
+            if (!t.isEmpty() && !t.equals(cmd)) cleaned.append(t).append('\n');
+        }
+        String reply = cleaned.toString().trim();
+        record(cmd, reply);
+        return reply;
+    }
+
+    /**
+     * Everything already waiting, kept for {@link LinkGate} and then dropped.
+     * Only the tail is kept: a reset banner and its prompt end the stream.
+     */
+    private static String drain(InputStream in) throws IOException {
+        StringBuilder sb = new StringBuilder();
+        byte[] buf = new byte[512];
+        while (in.available() > 0) {
+            int n = in.read(buf, 0, Math.min(in.available(), buf.length));
+            if (n <= 0) break;
+            sb.append(new String(buf, 0, n, StandardCharsets.US_ASCII));
+            if (sb.length() > 2048) sb.delete(0, sb.length() - 2048);
+        }
+        return sb.toString();
+    }
+
+    /** Read until the prompt or the deadline; the prompt stays in, for the gate. */
+    private static String readReply(InputStream in, long timeoutMs) throws IOException {
         StringBuilder sb = new StringBuilder();
         byte[] buf = new byte[256];
         // Monotonic: a wall-clock step (NTP, timezone-driven correction mid-drive)
@@ -275,15 +353,7 @@ final class ElmClient {
                 }
             }
         }
-        String text = sb.toString().replace(">", "");
-        StringBuilder cleaned = new StringBuilder();
-        for (String line : text.replace('\r', '\n').split("\n")) {
-            String t = line.trim();
-            if (!t.isEmpty() && !t.equals(cmd)) cleaned.append(t).append('\n');
-        }
-        String reply = cleaned.toString().trim();
-        record(cmd, reply);
-        return reply;
+        return sb.toString();
     }
 
     /** One exchange into the ring buffer, with the VIN read's answer left out. */
@@ -322,6 +392,13 @@ final class ElmClient {
     void initAdapter() throws IOException {
         caps.reset();
         caps.noteBanner(raw("ATZ", 6000));   // the banner names the chip - or the clone
+        // ATZ also clears the header (LinkGate): until target() has it confirmed
+        // again, raw() sends the adapter its setup and nothing else.
+        //
+        // No prompt in six seconds is an adapter that is not there. Writing on
+        // would only meet the prompt gate; probeBms reports it instead.
+        adapterSilent = gate.promptOwed();
+        if (adapterSilent) return;
         at("ATE0", 2000);
         at("ATL0", 2000);
         at("ATS0", 2000);
@@ -332,8 +409,10 @@ final class ElmClient {
     }
 
     /**
-     * Open the extended session. A few DIDs only answer there; it writes nothing
-     * and lapses on its own once we stop talking.
+     * Open the extended session. It writes nothing and lapses on its own once we
+     * stop talking. Opt-in (Prefs.extendedSession): no reading on the Nexon
+     * needs it, and holding it for a whole drive is the prime suspect for the
+     * dash warnings one owner saw.
      *
      * @return true if the ECU positively acknowledged (0x50). A refusal is not
      *         fatal - the default-session DIDs still work - so the caller decides.
@@ -342,6 +421,7 @@ final class ElmClient {
         String text = raw("1003", 4000);
         byte[] p = UdsCodec.reassemble(text).get(responseId);
         boolean accepted = p != null && p.length > 0 && (p[0] & 0xFF) == 0x50;
+        if (accepted) sessionOpened = true;
         // Recorded for the reports: an ECU that refuses the extended session is a
         // different problem from one that never answered the request at all.
         if (accepted) {
@@ -391,24 +471,16 @@ final class ElmClient {
         return String.format(Locale.ROOT, "positive, %d bytes", r.data == null ? 0 : r.data.length);
     }
 
-    /** Read an ASCII identification DID, trimmed; null when unsupported. */
+    /**
+     * Read an ASCII identification DID, trimmed; null when unsupported, and null
+     * for a truncated multi-frame reply (see {@link UdsCodec#idString}).
+     */
     String readIdString(String did) {
         try {
-            return asIdString(readIdResponse(did));
+            return UdsCodec.idString(readIdResponse(did));
         } catch (IOException e) {
             return null;
         }
-    }
-
-    private static String asIdString(UdsCodec.Response r) {
-        if (r == null || !r.isData()) return null;
-        StringBuilder sb = new StringBuilder();
-        for (byte b : r.data) {
-            int c = b & 0xFF;
-            if (c >= 32 && c < 127) sb.append((char) c);
-        }
-        String s = sb.toString().trim();
-        return s.isEmpty() ? null : s;
     }
 
     /**
@@ -423,15 +495,17 @@ final class ElmClient {
      * silence from a live adapter is the CAR's silence, not the adapter's.
      */
     ConnectPlan.Probe probeBms() throws IOException {
+        // Nothing has been written since a prompt-less ATZ, and nothing will be.
+        if (adapterSilent) return ConnectPlan.Probe.ADAPTER_SILENT;
         target(BmsFields.BMS_REQUEST);
         boolean alive = !caps.banner().isEmpty();
-        String text = raw("22" + BmsFields.DID_SYSTEM_NAME, 1500);
-        if ((text == null || text.trim().isEmpty()) && alive) {
-            // The adapter is alive, so give the car the window the session
-            // request gets before calling it silent: a slow clone prints NO DATA
-            // only after its own timeout, and 1.5 s is inside it.
-            text = raw("22" + BmsFields.DID_SYSTEM_NAME, 4000);
-        }
+        // One request, and a longer window when the adapter is alive: a slow
+        // clone prints NO DATA only after its own timeout, and 1.5 s is inside
+        // it. This used to re-send at 1.5 s instead - into an adapter still busy
+        // with the first request, which drops the first character of the second
+        // and runs the rest. The read ends at the prompt, so a quick reply
+        // costs nothing extra.
+        String text = raw("22" + BmsFields.DID_SYSTEM_NAME, alive ? 4000 : 1500);
         boolean uds = text != null && UdsCodec.decode22(text, responseId) != null;
         return ConnectPlan.classify(alive, text, uds);
     }
@@ -441,6 +515,13 @@ final class ElmClient {
         if (resp == null) throw new IOException("bad request id: " + requestHeader);
         responseId = resp;
         setHeader(requestHeader);
+        // A refused ATSH leaves the adapter on 7DF, the broadcast every module
+        // answers. raw() would refuse every request from here anyway; failing
+        // the connect says why.
+        if (!gate.headerVerified()) {
+            throw new IOException("The OBD adapter did not accept the battery controller's "
+                    + "address (ATSH" + requestHeader + ")");
+        }
         at("ATCRA" + responseId, 2000);
         at("ATFCSH" + requestHeader, 2000);
         at("ATFCSD300000", 2000);
@@ -566,7 +647,7 @@ final class ElmClient {
      *
      * TesterPresent writes nothing; it only stops the ECU's S3 timer from
      * expiring. The return value matters because the caller is the only thing
-     * that can repair a lapse: the session is opened once at connect, so if it
+     * that can repair a lapse: the session, when opted in, is opened once at connect, so if it
      * ever does drop, every extended-session-only DID reads blank for the rest of
      * the drive with nothing on screen to say why. Swallowing the outcome here
      * made that failure completely invisible.
@@ -597,13 +678,18 @@ final class ElmClient {
 
     void close() {
         BluetoothSocket s = socket;
-        if (s != null) {
+        // 1001 only to undo a 1003 the BMS acknowledged on this link, and only
+        // while the header is still 785: after an adapter reset it would go to
+        // 7DF and reach every module on the car.
+        if (s != null && sessionOpened && gate.headerVerified()) {
             try {
                 raw("1001", 800);   // leave the BMS in its default session
             } catch (IOException | RuntimeException ignored) {
                 // abort() may have pulled the streams out from under us
             }
         }
+        sessionOpened = false;
+        gate.reset();
         socket = null;
         in = null;
         out = null;

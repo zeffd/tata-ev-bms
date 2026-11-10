@@ -156,8 +156,9 @@ final class BmsFields {
         // down; the key stays "link_v" so nothing downstream moves.
         f.add(new Field("3482", "link_v",       "Busbar +", "V",  Kind.U16_DIV10,   false));
         f.add(new Field("3481", "busbar_neg_v", "Busbar -", "V",  Kind.U16_DIV10,   false));
-        // Pack voltage as the motor controller sees it, 1 V resolution.
-        f.add(new Field("3484", "mcu_dc_v",     "VCU busbar", "V", Kind.U16_RAW,    false));
+        // Pack voltage as the motor controller sees it, 1 V resolution - the
+        // BMS's own reading, as every field here is; no other module is asked.
+        f.add(new Field("3484", "mcu_dc_v",     "Busbar (MCU)", "V", Kind.U16_RAW,  false));
         // Matched (cell_max_mv - cell_min_mv) on 20 of 36 samples and differed by
         // exactly 1 mV on the rest - the skew between two batched reads.
         f.add(new Field("34D5", "cell_delta_bms_mv", "BMS delta", "mV", Kind.U16_RAW, false));

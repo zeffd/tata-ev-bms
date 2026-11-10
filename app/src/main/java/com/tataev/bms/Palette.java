@@ -16,10 +16,22 @@ final class Palette {
     /** Secondary labels and flat buttons. */
     static final int SOFT = 0xFFB4BCC5;
     static final int MUTED = 0xFF838C97;
-    static final int FAINT = 0xFF4C555F;
+    /**
+     * DID captions, file names, hints, disabled controls. The darkest grey that
+     * still reads: 4.53:1 on TILE and 4.99:1 on BG (WCAG AA is 4.5). The old
+     * 0xFF4C555F was 2.3:1 and carried the only long-press-to-delete hint.
+     */
+    static final int FAINT = 0xFF7A838D;
     static final int OK = 0xFF35D0BA;
     static final int WARN = 0xFFF2B441;
     static final int BAD = 0xFFF2564B;
+    /**
+     * The drive curve's max line and strongest-group rings: the app's teal
+     * darkened into the dark-mode lightness band, so it stays apart from BAD
+     * for colour-blind eyes. The grid is one shade off the ground.
+     */
+    static final int CURVE_MAX = 0xFF259A89;
+    static final int CURVE_GRID = 0xFF1C2127;
     /** The dashboard's alert banner: soft red text on a dark red ground. */
     static final int ALERT_TEXT = 0xFFFF8B82;
     static final int ALERT_BG = 0xFF24100E;

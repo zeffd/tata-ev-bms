@@ -1,6 +1,6 @@
 # Tata EV BMS
 
-A deliberately small Android app (**~125 KB APK, zero dependencies**) that reads
+A deliberately small Android app (**~155 KB APK, zero dependencies**) that reads
 live battery data from Tata electric vehicles over a cheap Bluetooth ELM327
 adapter — and helps find a weak cell group before it strands you.
 
@@ -25,6 +25,11 @@ Tata's own diagnostic tool uses across that range.
   strongest - time, voltage, offset from the pack's average group, current -
   and its mean offset at rest and under load. Verdicts are plain-language:
   *weak module*, *watch*, *low charge*.
+- **Drive curve** — one log against SOC instead of time: the weakest and
+  strongest cell at each charge step and which groups held each end, scrolled
+  sideways through the drive. It shows where a group takes over as the charge
+  falls; an *at rest* switch takes load sag out. Opened from a saved log's
+  pack map.
 - **All drives** — every logged drive replayed and tallied per group, so "the
   same group in 3 of 3 drives" is one screen, with a shareable findings report.
 - **Alerts** while you drive: cell spread, weakest-cell floor, the *knee* (a
@@ -42,13 +47,21 @@ The app never writes to the vehicle. Only these leave the phone:
 
 - ELM327 `AT…` setup (adapter-local, never reaches the car)
 - UDS **`0x22`** ReadDataByIdentifier — every actual measurement
-- UDS **`0x10 0x03`** extended session, **`0x3E`** TesterPresent, and
-  `0x10 0x01` on disconnect to leave the BMS in its default session
+- Only if switched on (Settings → Expert, **off by default**): UDS **`0x10 0x03`**
+  extended session, held with **`0x3E`** TesterPresent, and `0x10 0x01` on
+  disconnect to leave the BMS in its default session. Nothing on the Nexon
+  needs it.
 
 Enforcement is an **allowlist at the single choke point** every command passes
 through (`ElmClient.raw()` → `CommandGuard`). Writes (`0x2E`), DTC clears
 (`0x14`), resets (`0x11`), routines (`0x31`), IO control (`0x2F`) and
 SecurityAccess (`0x27`) are refused before they reach the socket — even by typo.
+
+Every request goes to the BMS alone. The allowlist pins the adapter's addressing
+to `785`/`78D`, and no UDS request is sent until the adapter has confirmed
+`ATSH785` since its last reset. An adapter that resets itself mid-drive (it would
+fall back to the `7DF` broadcast) is caught by its banner and set up again from
+scratch. Nothing is written while the adapter is still busy with the last command.
 
 ## Requirements
 
@@ -69,9 +82,10 @@ Grab the APK from the [Releases](../../releases) page, or build it yourself
 3. Open the app with the car awake. The app talks to the battery controller
    at 785; the car is named by VIN on first connect.
 
-The APK is debug-signed on purpose (it is a sideloaded diagnostic tool);
-installing a build signed by a different machine requires uninstalling first,
-which deletes on-device logs — share them off the phone before switching.
+Releases are signed with the project's release key once one is set up (see
+*Signing releases*); a local build without that key is debug-signed. Installing
+a build signed with a different key requires uninstalling first, which deletes
+on-device logs — share them off the phone before switching.
 
 ## Adapters
 
@@ -133,10 +147,41 @@ JDK 17; the Gradle wrapper fetches the rest (Android SDK 35 via `ANDROID_HOME`).
 Run the self-test — pure `javac`/`java`, no JUnit, no network, no device:
 
 ```bash
-./run-selftest.sh   # 725 assertions against real captured frames
+./run-selftest.sh   # 859 assertions against real captured frames
 ```
 
 Pushing a `v*` tag builds the APK in CI and attaches it to a GitHub release.
+
+### Signing releases
+
+Android installs an update only if it is signed with the same key as the
+installed app. Without a fixed key, each CI run signs with a fresh debug key,
+so every update needs an uninstall, which deletes the logs on the phone. To
+sign every release with one key:
+
+1. Create a keystore once and keep it (and its passwords) safe and out of the
+   repo; a lost key means one more uninstall:
+   ```bash
+   keytool -genkeypair -v -keystore release.jks -alias tataev \
+     -keyalg RSA -keysize 4096 -validity 10000
+   ```
+2. Base64-encode it: `base64 -i release.jks | tr -d '\n'` (macOS) or
+   `base64 -w0 release.jks` (Linux).
+3. In the GitHub repo, under *Settings → Secrets and variables → Actions*, add
+   four secrets: `RELEASE_KEYSTORE_BASE64` (the output of step 2),
+   `RELEASE_KEYSTORE_PASSWORD`, `RELEASE_KEY_ALIAS` (`tataev` above) and
+   `RELEASE_KEY_PASSWORD`. `keytool` makes a PKCS12 keystore by default, whose
+   key password IS the store password: give both secrets the same value.
+
+Without `RELEASE_KEYSTORE_BASE64`, CI warns and still builds a debug-signed APK.
+Locally, set `RELEASE_KEYSTORE` (an absolute path - a relative one is read from
+`app/`) and the other three as environment variables to sign with the same key;
+with none of them set the build is debug-signed, and with only some of them it
+stops with an error rather than signing with the wrong key.
+
+The first release signed with the new key cannot update an app signed with the
+old one, so it needs one last uninstall. **Share your logs off the phone
+first** (Logs → Share all); after that, updates install over each other.
 
 ## Project layout
 
@@ -148,7 +193,7 @@ selftest/                           test doubles + SelfTest.java
 
 The UI is built programmatically (no XML layouts, no AndroidX, no Compose) —
 the dashboard is generated from the field map, and that is how the APK stays
-around 125 KB.
+around 155 KB.
 
 ## License
 

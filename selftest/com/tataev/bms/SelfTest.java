@@ -63,6 +63,7 @@ public final class SelfTest {
         adapterReject();
         adapterCaps();
         probeClassification();
+        linkGate();
         scanReportHeader();
         packMap();
         groupMoments();
@@ -70,6 +71,9 @@ public final class SelfTest {
         deviationBaseline();
         scanTruncationReported();
         logReader();
+        logReaderSink();
+        driveCurve();
+        driveCurveEdges();
         replayDerivesGroupCount();
         swapAwareReplay();
         profileMatch();
@@ -228,7 +232,7 @@ public final class SelfTest {
         check("3480 allowed continuous regen 26.5 kW", dec("3480", "0109"), 26.5);
         check("3481 negative busbar 0.1 V", dec("3481", "0001"), 0.1);
         check("3482 positive busbar 345.8 V", dec("3482", "0D82"), 345.8);
-        check("3484 VCU busbar 346 V", dec("3484", "015A"), 346.0);
+        check("3484 MCU busbar 346 V", dec("3484", "015A"), 346.0);
         check("3404 relay byte raw", dec("3404", "06"), 6.0);
         check("340A hottest probe number", dec("340A", "05"), 5.0);
         check("340C coldest probe number", dec("340C", "02"), 2.0);
@@ -601,8 +605,16 @@ public final class SelfTest {
         check("ATSPA refused", CommandGuard.isAllowed("ATSPA"), false);
         check("ATTP0 auto-search refused", CommandGuard.isAllowed("ATTP0"), false);
         check("ATTPA refused", CommandGuard.isAllowed("ATTPA"), false);
-        // "Hear everyone" on a clone that refuses ATCRA: the mask, not the filter.
-        check("ATCM000 (11-bit open mask) allowed", CommandGuard.isAllowed("ATCM000"), true);
+        // BMS only, as a guard property: every id-carrying command is pinned to
+        // the one id the app uses. A header of 7DF is the functional broadcast,
+        // which every module on the car answers; 7E0 is another module.
+        check("ATSH7DF (broadcast) refused", CommandGuard.isAllowed("ATSH7DF"), false);
+        check("ATSH 7E0 (another module) refused", CommandGuard.isAllowed("ATSH 7E0"), false);
+        check("other ids refused on ATFCSH/ATCRA/ATCF",
+                CommandGuard.isAllowed("ATFCSH7DF") || CommandGuard.isAllowed("ATCRA7E8")
+                        || CommandGuard.isAllowed("ATCF7E8"), false);
+        check("ATCM000 (open mask: hear every module) refused",
+                CommandGuard.isAllowed("ATCM000"), false);
         // Every 29-bit form goes with the 29-bit addressing: an id is three hex
         // digits now, so an eight-digit one is not a CAN id at all.
         check("29-bit open mask refused", CommandGuard.isAllowed("ATCM00000000"), false);
@@ -640,7 +652,7 @@ public final class SelfTest {
         int refused = 0;
         for (String c : new String[]{"ATZ", "ATE0", "ATL0", "ATS0", "ATH1", "ATCAF1",
                 "ATSP6", "ATAT1", "ATCRA", "ATFCSD300000", "ATFCSM1",
-                "ATSH 785", "ATCRA78D", "ATFCSH785", "ATCM000", "ATCM7FF", "ATCF78D",
+                "ATSH 785", "ATSH785", "ATCRA78D", "ATFCSH785", "ATCM7FF", "ATCF78D",
                 "22F190", "22F1903402", "1001", "1003", "3E00"}) {
             if (!CommandGuard.isAllowed(c)) {
                 refused++;
@@ -1129,6 +1141,41 @@ public final class SelfTest {
         check("no identity at all -> empty",
                 ProfileMatch.fingerprint("", null), "");
 
+        // Binding a VIN-less car. Profile 1 predates serial reads and is on file
+        // under the supplier form; the first connect that reads the serial used
+        // to CREATE an empty profile beside it, losing the car's calibration.
+        Map<Integer, String> noVins = new java.util.HashMap<>();
+        Map<Integer, String> legacy = new java.util.LinkedHashMap<>();
+        legacy.put(1, "785|GOTION_BMS");
+        check("a serial read adopts the pre-serial profile, rekeyed",
+                bound(ProfileMatch.bind("", "2308305832", "GOTION_BMS", 1, noVins, legacy)),
+                "ADOPT 1 SN|2308305832");
+        // ...and without the supplier there is no telling whether that profile
+        // is this car's, so nothing is created or attached.
+        check("serial read, supplier not: stay, unresolved",
+                bound(ProfileMatch.bind("", "2308305832", null, 1, noVins, legacy)),
+                "STAY 1 - unresolved");
+        // A flaky F18C read on a serial-keyed profile fell back to the supplier
+        // form, matched the old profile and flipped to it mid-drive, resetting
+        // the pack map. It is the VIN rule's case: stay, attach nothing.
+        Map<Integer, String> both = new java.util.LinkedHashMap<>(legacy);
+        both.put(2, "SN|2308305832");
+        check("serial-keyed profile, serial read failed: stay",
+                bound(ProfileMatch.bind("", null, "GOTION_BMS", 2, noVins, both)),
+                "STAY 2 - unresolved");
+        Map<Integer, String> vinned = new java.util.HashMap<>();
+        vinned.put(1, "MAT612345TEST0000");
+        check("VIN-keyed profile, VIN read failed: stay",
+                bound(ProfileMatch.bind("", "2308305832", "GOTION_BMS", 1, vinned, legacy)),
+                "STAY 1 - unresolved");
+        // A truncated multi-frame reply is still surfaced for the dashboard, but
+        // its first frame alone is "230" - an identity no car has.
+        String serialFf = "78D100D62F18C323330";
+        check("a whole F18C keys a car, its first frame alone does not",
+                UdsCodec.idString(UdsCodec.decode22(serialFf + "\n78D2138333035383332", "78D"))
+                        + "|" + UdsCodec.idString(UdsCodec.decode22(serialFf, "78D")),
+                "2308305832|null");
+
         // "Is anything mapped on this profile?" - the question the Scan screen
         // and the reset button both ask. Prefs.hasAnyOverride needs
         // SharedPreferences, so the prefix scan - the place this class of bug
@@ -1158,6 +1205,13 @@ public final class SelfTest {
                 ProfileMatch.anyMapping(mine, "p2_"), true);
     }
 
+    /** A binding in one line: action, profile, what is stored, and whether it is unresolved. */
+    private static String bound(ProfileMatch.Binding b) {
+        String stored = b.vin + b.fingerprint;
+        return b.action + " " + b.profile + " " + (stored.isEmpty() ? "-" : stored)
+                + (b.unresolved ? " unresolved" : "");
+    }
+
     /** A profile-seeded map is right from the first sample and still self-corrects. */
     private static void seededPackMap() {
         System.out.println("\n=== profile-seeded pack map ===");
@@ -1177,6 +1231,21 @@ public final class SelfTest {
         check("data outvotes a wrong seed", w.seriesCount() >= 104, true);
         w.seed(50);
         check("seed after samples is ignored", w.seriesCount() >= 104, true);
+        // ...and must not skew the fits either. The votes corrected the count but
+        // the deviation baseline stayed at the seed, adding ~0.05 mOhm to every
+        // fitted group. The sweep opens under load, so samples are recorded
+        // against the seed before the first vote.
+        PackMap fresh = new PackMap(), wrong = new PackMap();
+        wrong.seed(104);
+        for (double amps : sweep(-70, 110, 600)) {
+            fresh.add(syntheticReading(96, 40, amps));
+            wrong.add(syntheticReading(96, 40, amps));
+        }
+        double fit = fresh.snapshot(40).excessMilliOhm, skewed = wrong.snapshot(40).excessMilliOhm;
+        check("a wrong seed does not skew the fitted resistance",
+                Math.abs(skewed - fit) < 0.01 ? "within 0.01"
+                        : String.format(Locale.ROOT, "%.3f vs %.3f", skewed, fit),
+                "within 0.01");
     }
 
     /**
@@ -1575,6 +1644,20 @@ public final class SelfTest {
                 txt.matches("(?s).*\\+\\d+% to \\+\\d+% over the pack's average group, "
                         + "\\d\\.\\d\\d to \\d\\.\\d\\d mOhm.*"), true);
         check("percentage range is the suspect drives'", g77.pctLo >= 40 && g77.pctHi <= 46, true);
+        // The group count is what the settled drives agree on. A short log that
+        // never settled replays as 105-106, and taking the maximum gave the whole
+        // history phantom squares.
+        List<PackMap> withShort = new ArrayList<>();
+        for (int d = 0; d < 4; d++) {
+            PackMap m = new PackMap();
+            boolean settles = d < 3;
+            for (int i = 0; i < (settles ? PackMap.BASELINE_SAMPLES : 5); i++) {
+                m.add(syntheticReading(settles ? 104 : 106, 77, 1.0));
+            }
+            withShort.add(m);
+        }
+        check("an unsettled short drive does not set the count",
+                PackHistory.aggregate(withShort).seriesCount, 104);
         check("empty history is honest", PackHistory.aggregate(new ArrayList<PackMap>()).drives, 0);
         check("...and has no findings",
                 PackHistory.aggregate(new ArrayList<PackMap>()).notable().isEmpty(), true);
@@ -1795,6 +1878,45 @@ public final class SelfTest {
         check("batch answered: never mute here", PollPlan.groupMute(false, 0), false);
         check("one silent-batch-singles-ok is a hiccup", PollPlan.dropBatching(1), false);
         check("two is the ECU telling us", PollPlan.dropBatching(2), true);
+
+        // The cycle floor comes from a stored setting; anything but the three
+        // offered values must not set the pace the adapter is polled at.
+        check("the three offered floors stand", PollPlan.pollFloorMs(250) + "/"
+                + PollPlan.pollFloorMs(500) + "/" + PollPlan.pollFloorMs(1000), "250/500/1000");
+        check("a stored value not offered falls back to 500", PollPlan.pollFloorMs(0) + "/"
+                + PollPlan.pollFloorMs(50) + "/" + PollPlan.pollFloorMs(750), "500/500/500");
+
+        // A BMS that refuses every known DID (NRC 0x31 on an unmapped model) used
+        // to look like silence, so the service reconnected forever and the
+        // mapping card never showed. Only a full cycle may say so.
+        check("full cycle, only refusals -> unmapped",
+                PollPlan.judgeUnusable(true, true, 6), PollPlan.Unusable.UNMAPPED);
+        check("full cycle, silence -> empty-poll rule",
+                PollPlan.judgeUnusable(true, true, 0), PollPlan.Unusable.EMPTY);
+        check("fast cycle, refusals -> not a judge of the model",
+                PollPlan.judgeUnusable(false, true, 2), PollPlan.Unusable.EMPTY);
+        check("full cycle, answered, nothing decoded -> unmapped",
+                PollPlan.judgeUnusable(true, false, 0), PollPlan.Unusable.UNMAPPED);
+        // Only "not served here" says the map is wrong. "Not now" (0x22) or a
+        // session refusal (0x7F) from a waking controller must not raise the
+        // needs-mapping card on a car the app already reads.
+        check("NRC 0x31 is a mapping refusal", PollPlan.isMappingRefusal(0x31), true);
+        check("NRC 0x22 / 0x7F are not",
+                PollPlan.isMappingRefusal(0x22) || PollPlan.isMappingRefusal(0x7F), false);
+
+        // The probe counts a refusal as an answer, so a link coming up proves
+        // nothing; only a usable reading earns the reconnect budget back.
+        PollPlan.FruitlessLinks links = new PollPlan.FruitlessLinks();
+        links.linkUp();
+        links.linkUp();
+        check("two links without a reading: one more try", links.spent(), false);
+        links.linkUp();
+        check("three links without a reading: stop", links.spent(), true);
+        check("a link that never read: wait before the next", links.lastLinkFruitless(), true);
+        links.usableReading();
+        check("a link that read: reconnect at once", links.lastLinkFruitless(), false);
+        links.linkUp();
+        check("a usable reading earns the budget back", links.spent(), false);
     }
 
     /**
@@ -2274,6 +2396,10 @@ public final class SelfTest {
                 && vh.get(0).cellUnitMv == 10, true);
         Map<String, String> s = DidScanner.suggest(t, vh);
         check("0.5 % is not suggested as SOC at 3.31 V/cell", s.get("soc_pct"), null);
+        // Parked, the SOC (3421 = 75.8 %) holds still between two reads ms apart,
+        // so "highest steady value in 70-100 %" picks it as SOH. With no SOC to
+        // set it apart from, no SOH is named at all.
+        check("no SOH named when no SOC was found (not 3421)", s.get("soh_pct"), null);
         check("floor is 10 % on an LFP plateau", DidScanner.socFloorTenths(vh), 100);
         check("no hypotheses, no floor", DidScanner.socFloorTenths(new ArrayList<>()), 0);
         List<String> whole = new ArrayList<>();
@@ -2289,7 +2415,17 @@ public final class SelfTest {
         List<DidScanner.Hit> n = new ArrayList<>(Arrays.asList(
                 hit("3400", 2, "0D87", "0D88"), hit("3415", 2, "0D00", "0D02"),
                 hit("3417", 2, "0CF7", "0CF8"), hit("3402", 2, "0375", "0378")));
-        check("Nexon SOC still suggested", DidScanner.suggest(n).get("soc_pct"), "3402");
+        Map<String, String> ns = DidScanner.suggest(n);
+        check("Nexon SOC still suggested", ns.get("soc_pct"), "3402");
+        // Applying it after an earlier whole-percent pick: the DID moves to a
+        // tenths code, and a 1;0;2 left behind would read 0x0378 as 888 %.
+        Prefs p = new Prefs();
+        p.scales.put("soc_pct", "1;0;2");
+        p.scales.putAll(DidScanner.scalesOnApply(ns, null));
+        BmsFields.Field socF = BmsFields.byKey("soc_pct");
+        check("applying an SOC suggestion clears a stale 1;0;2 scale",
+                BmsFields.decode(socF, new byte[]{0x03, 0x78}, BmsFields.scaleOf(socF, p),
+                        0.1, 32000), 88.8);
     }
 
     /**
@@ -2303,29 +2439,48 @@ public final class SelfTest {
         check("a VIN-shaped run is scrubbed", Redact.withoutVin("x MAT612345TEST0000 y"), "x \u2026 y");
         check("short runs survive", Redact.withoutVin("7E3 62341E0CE8"), "7E3 62341E0CE8");
         check("null is empty", Redact.withoutVin(null), "");
+        // With ATS0 + ATH1 every frame is a run of 17+ hex characters, and every
+        // hex character is in the VIN alphabet - so the scrub used to wipe the
+        // very multi-frame replies this report exists to show.
+        check("a hex-encoded VIN inside one line is scrubbed",
+                Redact.withoutVin("7EB101462F1904D41543631323334355445535430303030"), "…");
         List<String> roles = Arrays.asList("pack_v=341E", "cell_min_mv=3478", "cell_max_mv=3477", "soc_pct=3421");
-        String traffic = "> 22341E34013478\nNO DATA\n\n> 22341E\n7EB0562341E0CE8\n\n> 22F190\n(VIN read - not recorded)";
+        String traffic = "> 22341E34013478\nNO DATA\n\n> 22341E\n7EB0562341E0CE8\n\n> 22F190\n(VIN read - not recorded)"
+                + "\n\n> 22F197\n78D101B62F197424D53";
         String r = PollReport.render("Adapter: ELM327 v2.1\nAdapter rejected: none\n", "1.2", "ATSP6", "785",
                 true, roles, traffic, "no usable reading in 3 polls",
-                "NRC 78", "accepted");
+                "NRC 78", "accepted", true);
         check("names the target", r.contains("Target: 785"), true);
         check("says whether batching was on", r.contains("Batching: on"), true);
         check("lists the roles asked", r.contains("pack_v=341E"), true);
         check("carries the traffic", r.contains("> 22341E34013478"), true);
         check("carries the reason", r.contains("no usable reading"), true);
-        check("no VIN-shaped run", r.matches("(?s).*[A-HJ-NPR-Z0-9]{17}.*"), false);
+        check("a captured multi-frame reply survives", r.contains("78D101B62F197424D53"), true);
+        check("no VIN-shaped run", Redact.withoutVin(r), r);
         check("ends with newline", r.endsWith("\n"), true);
         // How the VIN read went, never what it said.
         check("VIN read outcome is stated", r.contains("VIN read: NRC 78"), true);
         check("session outcome is stated", r.contains("Session: accepted"), true);
         String leaky = PollReport.render("", "1.2", "ATSP6", "785", false, roles,
                 "> 22F190\n7EB1014...4D41543631323334355445535430303030", "x",
-                "no reply", "refused NRC 22");
+                "no reply", "refused NRC 22", true);
         check("a VIN that slipped into traffic is scrubbed anyway",
                 leaky.matches("(?s).*[A-HJ-NPR-Z0-9]{17}.*"), false);
         check("batching off is said too", leaky.contains("Batching: off"), true);
         check("a failed VIN read is stated too", leaky.contains("VIN read: no reply"), true);
         check("a refused session is stated", leaky.contains("Session: refused NRC 22"), true);
+
+        // Retention: the newest ten poll reports stay, and nothing else in the
+        // logs directory is touched - the drive logs live there too.
+        List<String> names = new ArrayList<>(Arrays.asList(
+                "bms_20260101_000000.csv", "scan_20260101_000000.txt", "poll_notes.csv"));
+        // Listed out of order, as File.list() may: evens to the front, odds to the back.
+        for (int s = 10; s <= 21; s++) {
+            names.add(s % 2 == 0 ? 0 : names.size(), "poll_20261109_1200" + s + ".txt");
+        }
+        check("only the oldest poll reports past ten are pruned",
+                PollReport.stale(names.toArray(new String[0])).toString(),
+                "[poll_20261109_120010.txt, poll_20261109_120011.txt]");
     }
 
     /**
@@ -2655,6 +2810,307 @@ public final class SelfTest {
                 last.recent.get(0).atMs, 1787630039000L);
     }
 
+    private static void logReaderSink() throws Exception {
+        System.out.println("\n=== reading a saved log: every row handed on ===");
+        java.io.File f = java.io.File.createTempFile("bmscurve", ".csv");
+        f.deleteOnExit();
+        // Pre-v3.3 names again, and SOC only on every fifth row, the way the
+        // service writes a two-speed poll.
+        java.io.PrintWriter w = new java.io.PrintWriter(f, "UTF-8");
+        w.println("epoch_ms,timestamp,soc_pct,pack_v,current_a,cell_min_mv,cell_min_idx,"
+                + "cell_max_mv,cell_max_idx,raw_cell_min_idx_3419,raw_cell_max_idx_341A,app_ver");
+        for (int i = 0; i < 20; i++) {
+            String soc = i % 5 == 0
+                    ? String.format(java.util.Locale.ROOT, "%.1f", 60.0 - i * 0.1) : "";
+            w.printf(java.util.Locale.ROOT,
+                    "%d,2026-08-25 10:00:%02d,%s,346.0,30.0,3300,4,3340,77,04,4D,3.2%n",
+                    1787630000000L + i * 1000L, i, soc);
+        }
+        w.close();
+        final java.util.List<Object[]> got = new java.util.ArrayList<>();
+        LogReader.Result r = LogReader.read(f,
+                (ms, soc, packV, minMv, maxMv, minIdx, maxIdx, amps) ->
+                        got.add(new Object[]{ms, soc, minIdx, maxIdx}));
+        check("every replayed row reaches the sink", got.size(), r.rows);
+        check("...all twenty", got.size(), 20);
+        check("SOC is carried between readings", got.get(3)[1], 60.0);
+        check("...and picks up the next one", got.get(5)[1], 59.5);
+        check("the sink sees the DID-resolved minimum", got.get(0)[2], 77);
+        check("...and maximum", got.get(0)[3], 4);
+        check("the row's clock rides along", got.get(19)[0], 1787630019000L);
+        check("the plain read is unchanged", LogReader.read(f).rows, 20);
+
+        // A wake-up row reads 0 V and SOC 0, then SOC is blank for four rows;
+        // mid-drive one reading is 0 and is carried over its blank rows too.
+        // Neither may turn a 76% to 70% drive into a "charge from 0%".
+        java.io.File wake = java.io.File.createTempFile("bmswake", ".csv");
+        wake.deleteOnExit();
+        java.io.PrintWriter ww = new java.io.PrintWriter(wake, "UTF-8");
+        ww.println("epoch_ms,pack_v,cell_min_mv,cell_max_mv,current_a,cell_min_idx,"
+                + "cell_max_idx,soc_pct,app_ver,layout");
+        long at = 1787630000000L;
+        ww.println((at++) + ",0,0,0,0,0,0,0,1.3,2");
+        for (int j = 0; j < 4; j++) ww.println((at++) + ",352,3300,3340,30,77,8,,1.3,2");
+        for (int s = 760; s >= 700; s--) {
+            for (int j = 0; j < 5; j++) {
+                String soc = j > 0 ? ""
+                        : s == 730 ? "0" : String.format(java.util.Locale.ROOT, "%.1f", s / 10.0);
+                ww.println((at++) + ",352," + (3300 - (760 - s)) + ",3340,30,77,8," + soc + ",1.3,2");
+            }
+        }
+        ww.close();
+        DriveCurve woke = new DriveCurve();
+        LogReader.read(wake, woke);
+        DriveCurve.Curve wc = woke.build();
+        check("a SOC-0 wake-up row and a mid-drive 0 keep 0.1% steps", wc.binPct(), 0.1);
+        check("...the drive still runs high to low", wc.charging, false);
+        check("...with no 0% step", wc.loSoc, 70.0);
+    }
+
+    private static void feed(DriveCurve dc, double soc, int minMv, int maxMv, int minIdx,
+                             int maxIdx, double amps) {
+        dc.row(0L, soc, 350.0, minMv, maxMv, minIdx, maxIdx, amps);
+    }
+
+    private static DriveCurve.Step curveStep(int column, int n) {
+        return new DriveCurve.Step(column, 50.0, n, 3300, 3340, 3290, 3350,
+                new int[0][], new int[0][]);
+    }
+
+    /** A drive on +30 A through whole-percent {@code socs}: "drive 80.0-70.0", " +note" if split. */
+    private static String wholeDrive(int... socs) {
+        DriveCurve d = new DriveCurve();
+        for (int p : socs) for (int j = 0; j < 4; j++) feed(d, p, 3300 - (80 - p), 3340, 77, 8, 30);
+        DriveCurve.Curve c = d.build();
+        return String.format(java.util.Locale.ROOT, "%s %.1f-%.1f%s", c.charging ? "charge" : "drive",
+                c.startSoc, c.endSoc, c.legNote.isEmpty() ? "" : " +note");
+    }
+
+    private static DriveCurve.Step stepAtSoc(DriveCurve.Curve c, double soc) {
+        for (DriveCurve.Step s : c.all) if (Math.abs(s.soc - soc) < 1e-9) return s;
+        return null;
+    }
+
+    private static void driveCurve() {
+        System.out.println("\n=== drive curve: cells against SOC ===");
+        // 76.0% down to 74.5%: five samples per 0.1% step, the first of each
+        // parked, the minimum sagging 2 mV a step.
+        DriveCurve dc = new DriveCurve();
+        for (int t = 760; t >= 745; t--) {
+            int base = 3300 - (760 - t) * 2;
+            for (int j = 0; j < 5; j++) {
+                feed(dc, t / 10.0, base + j, 3340 + j, j < 3 ? 77 : 35, 8, j == 0 ? 0 : 60);
+            }
+        }
+        DriveCurve.Curve c = dc.build();
+        check("a drive draws", c.problem, DriveCurve.Problem.NONE);
+        check("0.1% steps on a short range", c.binPct(), 0.1);
+        check("a drive runs high to low", c.charging, false);
+        check("one column per 0.1%", c.columns, 16);
+        check("every step has samples", c.all.size(), 16);
+        DriveCurve.Step first = c.all.get(0);
+        check("the first column is the start of the drive", first.soc, 76.0);
+        check("...its sample count", first.n, 5);
+        check("...typical min is the median", first.typicalMin, 3302);
+        check("...typical max is the median", first.typicalMax, 3342);
+        check("...lowest dip", first.lowestMin, 3300);
+        check("...highest peak", first.highestMax, 3344);
+        check("...most often weakest", first.weakest[0][0], 77);
+        check("...and how often", first.share(first.weakest[0][1]), 0.6);
+        check("five samples are not thin", first.thin(), false);
+        check("at rest keeps only the parked sample", c.atRest.get(0).n, 1);
+        check("...which is thin", c.atRest.get(0).thin(), true);
+        check("...with its own typical min", c.atRest.get(0).typicalMin, 3300);
+        check("samples counted", c.samples, 80);
+        check("parked samples counted", c.restSamples, 16);
+        check("lowest point is where the min sagged most", c.lowest.soc, 74.5);
+        check("...its dip", c.lowest.lowestMin, 3270);
+        check("one leader all drive: one stretch", c.handovers.size(), 1);
+        check("...named", c.handovers.get(0).group, 77);
+        check("...from the start", c.handovers.get(0).fromSoc, 76.0);
+        check("...to the end", c.handovers.get(0).toSoc, 74.5);
+        check("chips: the drive's weakest groups", c.chips.toString(), "[77, 35]");
+        check("step label at 0.1%", c.stepLabel(first), "76.0%");
+        check("nearest at-rest step to a column", c.nearest(c.atRest, 3).column, 3);
+        check("no step to be nearest to",
+                c.nearest(new java.util.ArrayList<DriveCurve.Step>(), 3), null);
+
+        // Leaders by band: g35 for 30-26% with one band of g12 at 27% - a flicker,
+        // not a handover - then g15 from 25% to 20%.
+        DriveCurve hv = new DriveCurve();
+        for (int t = 300; t >= 200; t--) {
+            int band = t / 10;
+            int leader = band >= 26 ? (band == 27 ? 12 : 35) : 15;
+            for (int j = 0; j < 3; j++) feed(hv, t / 10.0, 3200, 3240, leader, 8, 40);
+        }
+        DriveCurve.Curve h = hv.build();
+        check("a one-band flicker is folded away", h.handovers.size(), 2);
+        check("...the first stretch", h.handovers.get(0).group, 35);
+        check("...hands over at its lowest band's edge", h.handovers.get(0).toSoc, 26.0);
+        check("...the second stretch", h.handovers.get(1).group, 15);
+        check("...runs to the end", h.handovers.get(1).toSoc, 20.0);
+        check("handover line", h.handoverLine(), "g35 30.0–26.0% · g15 26.0–20.0%");
+
+        DriveCurve many = new DriveCurve();
+        for (int t = 300; t >= 200; t--) {
+            int band = t / 10;
+            feed(many, t / 10.0, 3200, 3240, 1 + Math.min(4, (30 - band) / 2), 8, 40);
+        }
+        DriveCurve.Curve mc = many.build();
+        check("more than four stretches are cut to four", mc.handovers.size(), 4);
+        check("...and say so", mc.handoversTruncated, true);
+        check("...in the line", mc.handoverLine().endsWith(" · …"), true);
+
+        // A 20% to 100% charge.
+        DriveCurve chg = new DriveCurve();
+        for (int t = 200; t <= 1000; t++) feed(chg, t / 10.0, 3300, 3350, 15, 8, -30);
+        DriveCurve.Curve cc = chg.build();
+        check("a charge runs low to high", cc.charging, true);
+        check("a wide range bins wider", cc.binPct(), 0.5);
+        check("...into about 200 columns at most", cc.columns, 161);
+        check("...the first column is the start of the charge", cc.all.get(0).soc, 20.0);
+        check("...holding five 0.1% readings", cc.all.get(0).n, 5);
+        check("...the last column is 100%", cc.all.get(cc.all.size() - 1).soc, 100.0);
+        check("step label on a wide bin", cc.stepLabel(cc.all.get(0)), "20.0–20.4%");
+
+        check("three missing steps keep the line",
+                DriveCurve.breaksBefore(curveStep(0, 5), curveStep(4, 5)), false);
+        check("four missing steps break it",
+                DriveCurve.breaksBefore(curveStep(0, 5), curveStep(5, 5)), true);
+        check("four samples are thin", curveStep(0, 4).thin(), true);
+
+        check("no rows at all", new DriveCurve().build().problem, DriveCurve.Problem.NO_ROWS);
+        DriveCurve noSoc = new DriveCurve();
+        noSoc.row(0L, null, 350, 3300, 3340, 77, 8, 10);
+        check("rows but no SOC", noSoc.build().problem, DriveCurve.Problem.NO_SOC);
+        DriveCurve flat = new DriveCurve();
+        for (int t = 500; t <= 505; t++) feed(flat, t / 10.0, 3300, 3340, 77, 8, 10);
+        DriveCurve.Curve fc = flat.build();
+        check("half a percent is too little", fc.problem, DriveCurve.Problem.TOO_LITTLE_SOC);
+        check("...and says how much it moved", fc.problemText().contains("0.5%"), true);
+
+        DriveCurve junk = new DriveCurve();
+        for (int t = 600; t >= 580; t--) feed(junk, t / 10.0, 3300, 3340, 77, 8, 10);
+        feed(junk, 59.0, 3000, 3340, 255, 8, 10);
+        feed(junk, 102.3, 3300, 3340, 77, 8, 10);
+        check("an index sentinel and a garbage SOC are dropped", junk.build().samples, 21);
+        check("...and never widen the group axis", junk.build().highIndex, 77);
+
+        DriveCurve zb = new DriveCurve();
+        for (int t = 600; t >= 580; t--) feed(zb, t / 10.0, 3300, 3340, 0, 95, 10);
+        check("zero-based: group 0 stays on the axis", zb.build().lowIndex, 0);
+
+        // Downhill regen lifts SOC a whole 1.0% in bursts between stretches of
+        // load: a rise its current does not carry is still the drive.
+        DriveCurve regen = new DriveCurve();
+        for (int t = 500; t >= 490; t--) feed(regen, t / 10.0, 3300, 3340, 77, 8, 60);
+        for (int t = 491; t <= 500; t++) feed(regen, t / 10.0, 3310, 3345, 35, 8, t % 3 == 0 ? -60 : 8);
+        for (int t = 499; t >= 480; t--) feed(regen, t / 10.0, 3295, 3338, 77, 8, 60);
+        DriveCurve.Curve rc = regen.build();
+        check("a drive with regen is still a drive", rc.charging, false);
+        check("a step visited three times holds all three", stepAtSoc(rc, 49.3).n, 3);
+
+        // 80% to 60% with half a percent of regen every 2%, alone and then
+        // followed by a charge to 85% in the same log. Regen is not a charge; the
+        // two-leg log draws its longer leg only, or each step's medians would mix
+        // a loaded pack with a charging one.
+        DriveCurve blips = new DriveCurve(), driveCharge = new DriveCurve();
+        for (int t = 800; t >= 600; t--) {
+            for (DriveCurve each : new DriveCurve[]{blips, driveCharge}) {
+                feed(each, t / 10.0, 3550, 3600, 77, 8, 60);
+                if (t % 20 == 0 && t > 600 && t < 800) {
+                    for (int u = 1; u <= 5; u++) feed(each, (t + u) / 10.0, 3560, 3600, 77, 8, -40);
+                }
+            }
+        }
+        for (int t = 601; t <= 850; t++) feed(driveCharge, t / 10.0, 3800, 3830, 15, 8, -120);
+        check("regen blips do not split a drive", blips.build().legNote, "");
+        DriveCurve.Curve dcc = driveCharge.build();
+        check("a drive then a charge draws the longer leg, the charge", dcc.charging, true);
+        // The drive's own 3550s are the trap: in a step mixed with the charge,
+        // or at 60.0% where both legs read the same SOC.
+        check("...holding none of the drive's readings", dcc.lowest.lowestMin, 3800);
+        check("...and the subtitle says so", dcc.legNote.isEmpty(), false);
+        // A whole-percent car steps back up one percent on regen, early or late
+        // in a drive. One reported step is no charge.
+        check("whole percent, a regen step early: one drive, start to end",
+                wholeDrive(80, 79, 80, 79, 78, 77, 76, 75, 74, 73, 72, 71, 70), "drive 80.0-70.0");
+        check("...and a regen step late",
+                wholeDrive(80, 79, 78, 77, 76, 75, 74, 73, 72, 73, 72, 71, 70), "drive 80.0-70.0");
+
+        DriveCurve both = new DriveCurve();
+        int t = 600;
+        int[] counts = {50, 40, 30, 20};
+        for (int g = 1; g <= 4; g++) {
+            for (int i = 0; i < counts[g - 1]; i++) feed(both, (t--) / 10.0, 3300, 3340, g, 8, 30);
+        }
+        for (int i = 0; i < 6; i++) feed(both, (t--) / 10.0, 3300, 3340, 77, 8, 30);
+        for (int i = 0; i < 5; i++) feed(both, (t--) / 10.0, 3300, 3340, 9, 77, -30);
+        check("a group at both ends earns a chip", both.build().chips.toString(),
+                "[1, 2, 3, 4, 77]");
+
+        String text = DriveCurve.render("bms_x.csv", h, g -> g == 15 ? "low charge" : null);
+        check("share names the handovers",
+                text.contains("Weakest by charge: g35 30.0–26.0% · g15 26.0–20.0%"), true);
+        check("...and the pack map's verdict", text.contains("(low charge)"), true);
+        check("...and carries no VIN-shaped run", Redact.withoutVin(text), text);
+        check("groups line",
+                DriveCurve.groups(new int[][]{{15, 44}, {35, 25}, {1, 20}, {77, 11}}, 100, 3, null),
+                "g15 44% · g35 25% · g1 20% · +1 more");
+    }
+
+    private static void driveCurveEdges() {
+        System.out.println("\n=== drive curve: edges a real log hits ===");
+        // A drive that starts exactly on a whole percent: its top band is one
+        // reading wide, and a different leader there is not a stretch.
+        DriveCurve top = new DriveCurve();
+        for (int j = 0; j < 3; j++) feed(top, 95.0, 3300, 3340, 1, 8, 30);
+        for (int t = 949; t >= 895; t--) feed(top, t / 10.0, 3300, 3340, 35, 8, 30);
+        check("a zero-width first stretch is dropped", top.build().handoverLine(),
+                "g35 95.0–89.5%");
+        DriveCurve full = new DriveCurve();
+        for (int t = 950; t < 1000; t++) feed(full, t / 10.0, 3300, 3340, 15, 8, -30);
+        for (int j = 0; j < 3; j++) feed(full, 100.0, 3300, 3340, 50, 8, -30);
+        check("a charge ending at 100.0 has no 100.0–100.0 stretch",
+                full.build().handoverLine(), "g15 95.0–100.0%");
+
+        // One glitch row must not become the headline or blow up the axis.
+        DriveCurve glitch = new DriveCurve();
+        for (int t = 600; t >= 580; t--) feed(glitch, t / 10.0, 3300, 3340, 77, 8, 10);
+        glitch.row(0L, 59.0, 0.0, 0, 0, 0, 0, 0);            // pack volts gone
+        glitch.row(0L, 59.0, 350.0, 0, 3340, 77, 8, 10);     // a zero cell
+        glitch.row(0L, 59.0, 350.0, 3300, 65535, 77, 8, 10); // a 0xFFFF cell
+        DriveCurve.Curve gc = glitch.build();
+        check("rows with no pack volts or impossible cells are dropped", gc.samples, 21);
+        check("...so the lowest cell stays real", gc.lowest.lowestMin, 3300);
+        check("...and group 0 does not appear", gc.lowIndex, 8);
+        // Parked at 76.0%, one SOC-0 row with good volts, then the drive: the
+        // glitch must not take the parked run before it along.
+        DriveCurve parked = new DriveCurve();
+        for (int j = 0; j < 60; j++) feed(parked, 76.0, 3330, 3340, 5, 9, 0);
+        feed(parked, 0.0, 3300, 3340, 5, 9, 30);
+        for (int t = 759; t >= 700; t--) feed(parked, t / 10.0, 3300 - (760 - t), 3340, 5, 9, 30);
+        DriveCurve.Curve pc = parked.build();
+        check("a SOC-0 row after a parked start keeps the parked run",
+                pc.startSoc + " " + pc.restSamples, "76.0 60");
+
+        // A model that reports SOC in whole percent: one column per percent,
+        // not ten columns with nine of them empty and the line in pieces.
+        DriveCurve whole = new DriveCurve();
+        for (int p = 80; p >= 60; p--) {
+            for (int j = 0; j < 4; j++) feed(whole, p, 3300 - (80 - p), 3340, 77, 8, 30);
+        }
+        DriveCurve.Curve wc = whole.build();
+        check("whole-percent SOC bins at 1%", wc.binPct(), 1.0);
+        check("...one column per percent", wc.columns, 21);
+        boolean anyBreak = false;
+        for (int i = 1; i < wc.all.size(); i++) {
+            anyBreak |= DriveCurve.breaksBefore(wc.all.get(i - 1), wc.all.get(i));
+        }
+        check("...and the line is one piece", anyBreak, false);
+        check("...labelled as a whole percent", wc.stepLabel(wc.all.get(0)), "80.0–80.9%");
+    }
+
     // ------------------------------------------------------- adapter refusal
 
     private static void adapterReject() {
@@ -2730,6 +3186,73 @@ public final class SelfTest {
                 ConnectPlan.classify(true, "78D0362F197...", true), ConnectPlan.Probe.ANSWERED);
         check("a refusal is still an answer",
                 ConnectPlan.classify(true, "78D037F2231", true), ConnectPlan.Probe.ANSWERED);
+    }
+
+    /**
+     * The gates in front of every write to the adapter. A request must never
+     * reach 7DF, the broadcast every module answers, which is where an adapter
+     * that reset itself or refused ATSH785 is left; and nothing may be written
+     * into an adapter still busy with the last command, which drops the first
+     * character and runs the rest ("22F197" becomes "2F197").
+     */
+    private static void linkGate() {
+        System.out.println("\n=== link gate: header, reset, prompt ===");
+        LinkGate g = new LinkGate();
+        check("UDS before any ATSH is refused",
+                g.beforeWrite("22F197", ""), LinkGate.Verdict.UNADDRESSED);
+        g.afterReply("ATSH785", "?\r\r>");
+        check("a refused ATSH785 leaves UDS refused",
+                g.beforeWrite("22F197", ""), LinkGate.Verdict.UNADDRESSED);
+        g.afterReply("ATSH785", "OK\r\r>");
+        check("ATSH785 answered OK opens UDS",
+                g.beforeWrite("22F197", ""), LinkGate.Verdict.PROCEED);
+
+        // A self-reset ELM327 prints its banner, then a prompt, and is back on 7DF.
+        check("banner in stray bytes is a reset, prompt or not",
+                g.beforeWrite("3E00", "\r\rELM327 v1.5\r\r>"), LinkGate.Verdict.RESET);
+        check("...and the header must be confirmed again",
+                g.beforeWrite("1003", ""), LinkGate.Verdict.UNADDRESSED);
+        g.afterReply("ATSH785", "OK\r\r>");
+        check("banner in a read's reply is a reset",
+                g.afterReply("22F197", "LV RESET\r\r>"), LinkGate.Verdict.RESET);
+        check("ATZ's own banner is not a reset",
+                g.afterReply("ATZ", "ATZ\r\r\rELM327 v1.5\r\r>"), LinkGate.Verdict.PROCEED);
+        check("...but ATZ leaves the header unconfirmed", g.headerVerified(), false);
+        check("a frame or NO DATA is not a banner",
+                LinkGate.isResetBanner("78D10146202F197")
+                        || LinkGate.isResetBanner("NO DATA\r\r>"), false);
+
+        // A read's deadline can fall mid-banner: the halves arrive in two texts.
+        LinkGate s = new LinkGate();
+        s.afterReply("ATSH785", "OK\r\r>");
+        s.afterReply("22F197", "\r\rEL");
+        check("banner split across a reply and the next drain is a reset",
+                s.beforeWrite("22F190", "M327 v1.5\r\r>"), LinkGate.Verdict.RESET);
+        s.afterReply("ATSH785", "OK\r\r>");
+        s.beforeWrite("22F190", "\r\rELM3");
+        check("banner split across a drain and its reply is a reset",
+                s.afterReply("22F190", "27 v1.5\r\r>"), LinkGate.Verdict.RESET);
+        // Some adapters greet on connect; ATZ's own banner then lands in the next
+        // drain. Before ATSH785 is confirmed no UDS can go out anyway, so a
+        // banner there is no reset - and treating it as one failed every connect.
+        LinkGate c = new LinkGate();
+        c.afterReply("ATZ", "ELM327 v1.5\r\r>");
+        check("a banner before the header is confirmed is not a reset",
+                c.beforeWrite("ATE0", "\r\rELM327 v1.5\r\r>"), LinkGate.Verdict.PROCEED);
+
+        // C1: nothing is written until the adapter has printed '>'.
+        g.afterReply("ATSH785", "OK\r\r>");
+        g.afterReply("22F197", "78D10146202F1");      // window closed mid-reply
+        check("no prompt seen: resync before the next write",
+                g.beforeWrite("22F190", ""), LinkGate.Verdict.RESYNC);
+        check("resync with no prompt back: write nothing", g.afterResync(""), LinkGate.Verdict.BUSY);
+        check("...and the next command still waits",
+                g.beforeWrite("22F190", ""), LinkGate.Verdict.RESYNC);
+        check("resync answered with a prompt: write",
+                g.afterResync("STOPPED\r\r>"), LinkGate.Verdict.PROCEED);
+        g.afterReply("22F197", "");
+        check("a late prompt in stray bytes is enough",
+                g.beforeWrite("22F190", "NO DATA\r\r>"), LinkGate.Verdict.PROCEED);
     }
 
     /**

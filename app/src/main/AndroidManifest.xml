@@ -83,6 +83,13 @@
             android:screenOrientation="portrait"
             android:label="Pack map" />
 
+        <!-- One saved log against SOC: the cells and who held each end. -->
+        <activity
+            android:name=".DriveCurveActivity"
+            android:exported="false"
+            android:screenOrientation="portrait"
+            android:label="Drive curve" />
+
         <!-- Every saved log replayed and its verdicts tallied per group. -->
         <activity
             android:name=".PackHistoryActivity"

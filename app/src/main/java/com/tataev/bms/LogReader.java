@@ -53,7 +53,23 @@ final class LogReader {
         }
     }
 
+    /**
+     * Every row the replay parses, handed on as it is read, so another view of
+     * the same log - the drive curve - sees exactly the rows, the carried SOC and
+     * the DID-resolved indices the pack map is given. The pack map may still
+     * refuse a row (no pack volts, an index sentinel); a sink applies its own
+     * bounds, as DriveCurve does.
+     */
+    interface RowSink {
+        void row(long epochMs, Double socPct, double packV, double minMv, double maxMv,
+                 int minIdx, int maxIdx, double amps);
+    }
+
     static Result read(File csv) throws IOException {
+        return read(csv, null);
+    }
+
+    static Result read(File csv, RowSink sink) throws IOException {
         PackMap map = new PackMap();
         int rows = 0;
         boolean corrected = false;
@@ -179,11 +195,20 @@ final class LogReader {
                 row.values.put("cell_max_idx", (double) Math.round(mxI));
                 row.values.put("current_a", cur);
                 Double soc = num(f, cSoc);
-                if (soc != null) lastSoc = soc;
+                // A row with no pack volts is a wake-up or dropped frame, and its
+                // SOC (often 0) is not a reading. Carried onto the SOC-blank rows
+                // after it, it turned a drive into a "charge from 0%" on the curve
+                // and gave the pack map a lowest SOC of 0. The row itself still
+                // goes on; the pack map and the curve drop it for its 0 V.
+                if (soc != null && pack > 0) lastSoc = soc;
                 if (lastSoc != null) row.values.put("soc_pct", lastSoc);
                 row.computeDerived();
                 map.add(row);
                 rows++;
+                if (sink != null) {
+                    sink.row(atMs == null ? 0 : atMs, lastSoc, pack, mn, mx,
+                            (int) Math.round(mnI), (int) Math.round(mxI), cur);
+                }
             }
         } finally {
             try {

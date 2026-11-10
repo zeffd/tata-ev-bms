@@ -111,6 +111,34 @@ final class PackMap {
         // and one mixed-sign mean would average it into "mildly low".
         int restMinMoments, restMaxMoments, loadMinMoments, loadMaxMoments;
         double restMinSum, restMaxSum, loadMinSum, loadMaxSum;
+        // The pack averages those deviations were measured against, summed the
+        // same way, so a wrong seeded baseline can be re-measured exactly.
+        double sa, sxa, restMinAvg, restMaxAvg, loadMinAvg, loadMaxAvg;
+
+        /**
+         * Re-measure every recorded deviation against the average scaled by
+         * {@code k}: deviation = mv - avg, so it grows by avg * (1 - k).
+         */
+        void rebase(double k) {
+            double f = 1 - k;
+            sy += f * sa;
+            sxy += f * sxa;
+            restMinSum += f * restMinAvg;
+            restMaxSum += f * restMaxAvg;
+            loadMinSum += f * loadMinAvg;
+            loadMaxSum += f * loadMaxAvg;
+            sa *= k;
+            sxa *= k;
+            restMinAvg *= k;
+            restMaxAvg *= k;
+            loadMinAvg *= k;
+            loadMaxAvg *= k;
+            for (int i = 0; i < recentN; i++) {
+                Moment mo = recent[i];
+                recent[i] = new Moment(mo.atMs, mo.mv,
+                        (int) Math.round(mo.mv - (mo.mv - mo.deltaMv) * k), mo.amps, mo.asMin);
+            }
+        }
 
         void remember(Moment mo) {
             head = (head + 1) % HISTORY_KEEP;
@@ -255,7 +283,8 @@ final class PackMap {
      *
      * Sizes the grid correctly from the first sample and pins the deviation
      * baseline to the same reference the last drive used. The count stays
-     * self-correcting - balanced and resting readings still vote on it - and
+     * self-correcting - balanced and resting readings still vote on it, and a
+     * seed the settled votes disagree with gives up the baseline too - and
      * the bound is 250, the same sentinel bound add() enforces,
      * so a profile poisoned by a pre-corroboration version cannot re-pin a
      * wrecked baseline for another drive.
@@ -452,6 +481,18 @@ final class PackMap {
                         || Math.abs(mean - seriesCount) >= SERIES_HYSTERESIS) {
                     seriesCount = (int) Math.round(mean);
                 }
+                // The seed stood in for the pin an unseeded map takes here. If the
+                // votes settle elsewhere the seed was wrong - another car's
+                // profile, or a stale learned size - and the count alone moving
+                // left every fit measured against it: a 104 seed on a 96-group
+                // pack added ~0.05 mOhm to each. Re-pin, and re-measure what was
+                // already recorded, so the drive keeps one reference.
+                if (seeded && seriesVotes == BASELINE_SAMPLES
+                        && seriesCount() != baselineSeries) {
+                    int to = seriesCount();
+                    for (Group g : groups) g.rebase((double) baselineSeries / to);
+                    baselineSeries = to;
+                }
             } else if (seriesVotes == 0 && !seeded) {
                 // Provisional: an unseeded pack first seen under load still gets
                 // its own size from the first sample rather than the default.
@@ -521,7 +562,7 @@ final class PackMap {
         // Every group sags together under load; that common motion says nothing
         // about which group is which, so measure each against the pack average.
         double avgMv = packV * 1000.0 / baselineSeries();
-        record(groups[minIdx], atMs, minMv, amps, minMv - avgMv, true);
+        record(groups[minIdx], atMs, minMv, amps, avgMv, true);
         groups[minIdx].minCount++;
         // WHEN a group holds the minimum separates low charge from resistance:
         // a low-charge group is lowest at rest, a resistive one under load.
@@ -539,7 +580,7 @@ final class PackMap {
         // been at both extremes, which is the single thing this class exists to
         // prevent.
         if (maxIdx != minIdx) {
-            record(groups[maxIdx], atMs, maxMv, amps, maxMv - avgMv, false);
+            record(groups[maxIdx], atMs, maxMv, amps, avgMv, false);
             groups[maxIdx].maxCount++;
         }
 
@@ -574,22 +615,25 @@ final class PackMap {
     }
 
     private static void record(Group g, long atMs, double mv, double amps,
-                               double deviationMv, boolean asMin) {
+                               double avgMv, boolean asMin) {
+        double deviationMv = mv - avgMv;
         g.n++;
         g.sx += amps;
         g.sy += deviationMv;
+        g.sa += avgMv;
         g.sxx += amps * amps;
         g.sxy += amps * deviationMv;
+        g.sxa += amps * avgMv;
         g.loI = Math.min(g.loI, amps);
         g.hiI = Math.max(g.hiI, amps);
         g.remember(new Moment(atMs, (int) Math.round(mv),
                 (int) Math.round(deviationMv), amps, asMin));
         if (Math.abs(amps) < REST_AMPS) {
-            if (asMin) { g.restMinMoments++; g.restMinSum += deviationMv; }
-            else       { g.restMaxMoments++; g.restMaxSum += deviationMv; }
+            if (asMin) { g.restMinMoments++; g.restMinSum += deviationMv; g.restMinAvg += avgMv; }
+            else       { g.restMaxMoments++; g.restMaxSum += deviationMv; g.restMaxAvg += avgMv; }
         } else if (amps >= WATCH_AMPS) {
-            if (asMin) { g.loadMinMoments++; g.loadMinSum += deviationMv; }
-            else       { g.loadMaxMoments++; g.loadMaxSum += deviationMv; }
+            if (asMin) { g.loadMinMoments++; g.loadMinSum += deviationMv; g.loadMinAvg += avgMv; }
+            else       { g.loadMaxMoments++; g.loadMaxSum += deviationMv; g.loadMaxAvg += avgMv; }
         }
     }
 

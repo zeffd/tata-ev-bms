@@ -5,9 +5,14 @@ import android.content.Context;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.StateListDrawable;
+import android.text.TextPaint;
+import android.util.DisplayMetrics;
 import android.util.StateSet;
+import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
+import android.view.Window;
+import android.view.WindowManager;
 import android.view.accessibility.AccessibilityNodeInfo;
 import android.widget.LinearLayout;
 import android.widget.TextView;
@@ -108,6 +113,58 @@ final class Ui {
                 info.setClassName(android.widget.Button.class.getName());
             }
         });
+    }
+
+    /**
+     * Hold or release the screen-on flag, touching the window only on a change.
+     *
+     * The dashboard decides every 500 ms, and addFlags/clearFlags each push the
+     * window's attributes to the window manager whether or not anything changed.
+     */
+    static void keepScreenOn(Window w, boolean on) {
+        int flag = WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON;
+        if (((w.getAttributes().flags & flag) != 0) == on) return;
+        if (on) {
+            w.addFlags(flag);
+        } else {
+            w.clearFlags(flag);
+        }
+    }
+
+    /** Reused by fitText, which only ever runs on the UI thread. */
+    private static final TextPaint FIT_PAINT = new TextPaint();
+
+    /**
+     * Shrink a one-line TextView's text until it fits widthPx.
+     *
+     * The dashboard tiles are fixed-pixel squares holding sp text, so at font
+     * scale 1.15-1.3 a value or label ran past the tile edge and was cut.
+     * TextView's own autosizing is API 26 and minSdk is 24, so this measures
+     * with the view's own Paint - typeface and letter spacing included - and
+     * steps down half an sp at a time from maxSp. It stops at minSp, where the
+     * view's ellipsis takes over. Call again after each setText.
+     *
+     * @return the size applied, in sp - a caller that passes it back as the next
+     *         maxSp makes a live value only ever shrink, so it does not jump
+     *         between sizes as its digit count changes on every refresh
+     */
+    static float fitText(TextView v, float maxSp, float minSp, int widthPx) {
+        if (widthPx <= 0) return maxSp;
+        CharSequence text = v.getText();
+        DisplayMetrics dm = v.getResources().getDisplayMetrics();
+        FIT_PAINT.set(v.getPaint());
+        float sp = maxSp;
+        while (sp > minSp) {
+            // SP through TypedValue, not scaledDensity: on API 34+ that is
+            // where the non-linear font scaling is applied.
+            FIT_PAINT.setTextSize(TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, sp, dm));
+            if (FIT_PAINT.measureText(text, 0, text.length()) <= widthPx) break;
+            sp -= 0.5f;
+        }
+        sp = Math.max(sp, minSp);
+        float px = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, sp, dm);
+        if (v.getTextSize() != px) v.setTextSize(TypedValue.COMPLEX_UNIT_PX, px);
+        return sp;
     }
 
     static TextView note(Context c, String text) {
